@@ -244,6 +244,9 @@ static esp_err_t file_handler(httpd_req_t *req) {
     
     if (is_encrypted) {
         // Desencriptar y enviar
+        // TODO: Para resoluciones mayores a VGA (ej: UXGA ~250KB) o múltiples
+        // clientes simultáneos, considerar desencriptar por chunks de 4KB
+        // en streaming para evitar OOM. Por ahora con VGA (~30KB) está OK.
         size_t dec_len = 0;
         uint8_t *dec_data = crypto_load_file(filename, &dec_len);
         

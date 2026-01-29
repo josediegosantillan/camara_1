@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include "esp_camera.h"
@@ -19,6 +20,39 @@
 static const char *TAG = "MAIN_APP";
 static bool sd_available = false;
 static uint32_t photo_counter = 0;
+
+// NVS para persistir el contador
+#define NVS_NAMESPACE_PHOTO "photos"
+#define NVS_KEY_COUNTER "counter"
+
+// Carga el contador desde NVS (sobrevive reinicios)
+static void load_photo_counter(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_PHOTO, NVS_READONLY, &nvs_handle);
+    if (err == ESP_OK) {
+        err = nvs_get_u32(nvs_handle, NVS_KEY_COUNTER, &photo_counter);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Contador de fotos recuperado: %lu", (unsigned long)photo_counter);
+        } else {
+            photo_counter = 0;
+            ESP_LOGI(TAG, "Contador de fotos iniciando en 0");
+        }
+        nvs_close(nvs_handle);
+    } else {
+        photo_counter = 0;
+    }
+}
+
+// Guarda el contador en NVS
+static void save_photo_counter(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_PHOTO, NVS_READWRITE, &nvs_handle);
+    if (err == ESP_OK) {
+        nvs_set_u32(nvs_handle, NVS_KEY_COUNTER, photo_counter);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+}
 
 // Captura foto encriptada y la guarda en SD
 static void capture_encrypted_photo(void) {
@@ -41,8 +75,11 @@ static void capture_encrypted_photo(void) {
     
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Foto guardada: %s.enc", filename);
+        // Persistir el contador para sobrevivir reinicios
+        save_photo_counter();
     } else {
         ESP_LOGE(TAG, "Error guardando foto encriptada");
+        photo_counter--;  // Revertir si falló
     }
 }
 
@@ -84,6 +121,9 @@ void app_main(void)
       ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // 1.1 CARGAR CONTADOR DE FOTOS (sobrevive reinicios)
+    load_photo_counter();
 
     // 2. INICIALIZAR PERIFÉRICOS (PIR y LEDs)
     peripheral_init();
