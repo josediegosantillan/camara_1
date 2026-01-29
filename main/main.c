@@ -1,17 +1,50 @@
 #include <stdio.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
+#include "esp_camera.h"
+#include "esp_heap_caps.h"
 
 // --- IMPORTAMOS NUESTROS MÓDULOS ---
 #include "cam_hal.h"
 #include "sd_hal.h"
 #include "wifi_net.h"
 #include "http_server.h"
+#include "crypto.h"
 
 static const char *TAG = "MAIN_APP";
+static bool sd_available = false;
+static uint32_t photo_counter = 0;
+
+// Captura foto encriptada y la guarda en SD
+static void capture_encrypted_photo(void) {
+    if (!sd_available) return;
+    
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        ESP_LOGE(TAG, "Error capturando foto");
+        return;
+    }
+    
+    // Generar nombre único
+    char filename[32];
+    snprintf(filename, sizeof(filename), "IMG_%08lu", (unsigned long)photo_counter++);
+    
+    // Guardar encriptado
+    esp_err_t ret = crypto_save_file(filename, fb->buf, fb->len);
+    
+    esp_camera_fb_return(fb);
+    
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Foto guardada: %s.enc", filename);
+    } else {
+        ESP_LOGE(TAG, "Error guardando foto encriptada");
+    }
+}
 
 // --- DEFINICIÓN DE PERIFÉRICOS DE LOGICA ---
 // Estos no son del driver de cámara, son de TU aplicación.
@@ -67,10 +100,24 @@ void app_main(void)
     // Si falla, seguimos igual (quizás solo queremos ver streaming)
     if (sd_card_init() != ESP_OK) {
         ESP_LOGW(TAG, "Sistema funcionando SIN almacenamiento local (SD Fallo o no presente).");
+        sd_available = false;
+    } else {
+        sd_available = true;
+        
+        // 4.1 INICIALIZAR ENCRIPTACIÓN
+        if (crypto_init() != ESP_OK) {
+            ESP_LOGE(TAG, "Error inicializando crypto - fotos NO se encriptarán");
+        } else {
+            ESP_LOGI(TAG, "Encriptación AES-256 activa");
+        }
     }
 
     // 5. INICIALIZAR RED (WiFi + AP Fallback)
     wifi_net_init();
+
+    // Esperar a que el WiFi se establezca (STA o AP)
+    ESP_LOGI(TAG, "Esperando conexion de red...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
     // 6. INICIALIZAR SERVIDOR WEB
     // Arranca el servidor MJPEG para ver video por IP
@@ -95,9 +142,14 @@ void app_main(void)
         if (movimiento) {
             ESP_LOGI(TAG, "¡MOVIMIENTO DETECTADO! (PIR ACTIVO)");
             
-            // Acá iría la lógica de encender IR y Grabar
-            // Por ahora solo prendemos el LED IR para probar hardware
+            // Encender LEDs IR
             gpio_set_level(IR_LEDS_GPIO, 1);
+            
+            // Capturar y guardar foto encriptada
+            capture_encrypted_photo();
+            
+            // Pequeño delay anti-rebote para no saturar con fotos
+            vTaskDelay(pdMS_TO_TICKS(2000));
         } else {
             // Apagamos IR si no hay movimiento
             gpio_set_level(IR_LEDS_GPIO, 0);
