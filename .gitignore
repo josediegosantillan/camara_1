@@ -1,0 +1,21 @@
+# CMake temporary files
+/build/
+/CMakeCache.txt
+/compile_commands.json
+/project_description.json
+
+# Local configuration
+/sdkconfig
+/sdkconfig.old
+
+# IDE settings
+/.vscode/
+
+# Managed components
+/managed_components/
+/dependencies.lock
+
+# Binary output files
+*.bin
+*.elf
+*.map
