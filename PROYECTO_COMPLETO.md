@@ -13,7 +13,7 @@ Sistema de cámara de seguridad basado en ESP32-CAM (AI-Thinker) con:
 - **Sensor cámara**: OV2640 (incluido)
 - **RAM externa**: PSRAM 4MB (incluido en AI-Thinker)
 - **Almacenamiento**: MicroSD (FAT32, cualquier capacidad)
-- **Sensor PIR**: Conectado a GPIO 13
+- **Sensor PIR**: Conectado a GPIO 16
 - **LEDs IR**: Conectados a GPIO 12 (opcional)
 
 ## Entorno de Desarrollo
@@ -644,7 +644,7 @@ idf_component_register(SRCS "main.c"
 
 ### Flujo Principal
 1. Inicializa NVS
-2. Configura periféricos (PIR en GPIO13, LEDs IR en GPIO12)
+2. Configura periféricos (PIR en GPIO16, LEDs IR en GPIO12)
 3. Inicializa cámara
 4. Monta SD card
 5. Inicializa encriptación (genera clave AES-256 única)
