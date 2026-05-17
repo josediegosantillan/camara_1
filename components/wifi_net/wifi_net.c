@@ -324,6 +324,21 @@ bool wifi_net_is_connected(void) {
     return s_is_connected;
 }
 
+int wifi_net_get_rssi(void) {
+    if (!s_is_connected || s_is_ap_mode) {
+        return 0;
+    }
+
+    wifi_ap_record_t ap_info = {0};
+    esp_err_t err = esp_wifi_sta_get_ap_info(&ap_info);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "No se pudo obtener RSSI actual: %s", esp_err_to_name(err));
+        return 0;
+    }
+
+    return ap_info.rssi;
+}
+
 void wifi_net_get_ip(char *ip_str, size_t len) {
     if (ip_str && len > 0) {
         strncpy(ip_str, s_current_ip, len - 1);

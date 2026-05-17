@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 #include "crypto.h"
+#include "cam_hal.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "wifi_net.h"
@@ -32,9 +33,14 @@ static httpd_handle_t server_httpd = NULL;
 #define NVS_KEY_LIVE_TIME "live_time"
 #define NVS_KEY_CAPTURE_MODE "cap_mode"
 #define NVS_KEY_VIDEO_DURATION "vid_dur"
+#define NVS_NAMESPACE_DEVICE "device_cfg"
+#define NVS_KEY_IMAGE_QUALITY "img_quality"
+#define NVS_KEY_FRAME_SIZE "frame_size"
 #define DEFAULT_EMISSION_TIME 30  // Segundos por defecto
 #define DEFAULT_LIVE_TIME 60      // Tiempo de vista en vivo por defecto
 #define DEFAULT_VIDEO_DURATION 10 // Duración de video por defecto
+#define DEFAULT_IMAGE_QUALITY CAM_HAL_DEFAULT_JPEG_QUALITY
+#define DEFAULT_FRAME_SIZE CAM_HAL_DEFAULT_FRAME_SIZE
 
 // ============================================================================
 // ESTADO DE DETECCIÓN DE MOVIMIENTO
@@ -49,6 +55,8 @@ static volatile int g_live_time_sec = DEFAULT_LIVE_TIME; // Tiempo de vista en v
 // Modo de captura (foto vs video)
 static volatile capture_mode_t g_capture_mode = CAPTURE_MODE_PHOTO;
 static volatile int g_video_duration_sec = DEFAULT_VIDEO_DURATION;
+static volatile int g_image_quality = DEFAULT_IMAGE_QUALITY;
+static volatile framesize_t g_frame_size = DEFAULT_FRAME_SIZE;
 
 // ============================================================================
 // FUNCIONES DE CONFIGURACIÓN NVS
@@ -104,6 +112,59 @@ static void save_motion_config(void) {
         ESP_LOGI(TAG, "Config guardada - Modo: %s, Emisión: %ds, Video: %ds", 
                  g_capture_mode == CAPTURE_MODE_VIDEO ? "VIDEO" : "FOTO",
                  g_emission_time_sec, g_video_duration_sec);
+    }
+}
+
+static void load_device_config(void) {
+    g_image_quality = DEFAULT_IMAGE_QUALITY;
+    g_frame_size = DEFAULT_FRAME_SIZE;
+
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_DEVICE, NVS_READONLY, &nvs_handle);
+    if (err == ESP_OK) {
+        int32_t quality_val = DEFAULT_IMAGE_QUALITY;
+        err = nvs_get_i32(nvs_handle, NVS_KEY_IMAGE_QUALITY, &quality_val);
+        if (err == ESP_OK && quality_val >= 10 && quality_val <= 63) {
+            g_image_quality = quality_val;
+        }
+
+        int32_t frame_val = DEFAULT_FRAME_SIZE;
+        err = nvs_get_i32(nvs_handle, NVS_KEY_FRAME_SIZE, &frame_val);
+        if (err == ESP_OK) {
+            g_frame_size = (framesize_t)frame_val;
+        }
+        nvs_close(nvs_handle);
+    }
+
+    err = cam_hal_set_jpeg_quality(g_image_quality);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "No se pudo aplicar calidad JPEG guardada (%d): %s",
+                 g_image_quality, esp_err_to_name(err));
+        g_image_quality = cam_hal_get_jpeg_quality();
+    } else {
+        ESP_LOGI(TAG, "Calidad JPEG cargada: %d", g_image_quality);
+    }
+
+    err = cam_hal_set_frame_size(g_frame_size);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "No se pudo aplicar frame size guardado (%d): %s",
+                 (int)g_frame_size, esp_err_to_name(err));
+        g_frame_size = cam_hal_get_frame_size();
+    } else {
+        ESP_LOGI(TAG, "Frame size cargado: %s", cam_hal_get_frame_size_name(g_frame_size));
+    }
+}
+
+static void save_device_config(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_DEVICE, NVS_READWRITE, &nvs_handle);
+    if (err == ESP_OK) {
+        nvs_set_i32(nvs_handle, NVS_KEY_IMAGE_QUALITY, g_image_quality);
+        nvs_set_i32(nvs_handle, NVS_KEY_FRAME_SIZE, (int32_t)g_frame_size);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+        ESP_LOGI(TAG, "Config de dispositivo guardada - Calidad JPEG: %d, Resolucion: %s",
+                 g_image_quality, cam_hal_get_frame_size_name(g_frame_size));
     }
 }
 
@@ -306,13 +367,41 @@ static const char* HTML_INDEX =
 "<script>"
 "let streamActive=false,forceMode=false,statusInterval=null;"
 "let viewerFiles=[],viewerIndex=0;"
+"let deviceLedOn=false;"
+"let frameSizeLabels={5:'QVGA',7:'HVGA',9:'CIF',10:'VGA',11:'SVGA',12:'XGA',13:'HD'};"
 
 "document.querySelectorAll('input[name=cap-mode]').forEach(r=>r.addEventListener('change',e=>{"
 "document.getElementById('video-opts').style.display=e.target.value=='1'?'block':'none';}));"
 
 "function showTab(n){document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',i==n));"
 "document.querySelectorAll('.panel').forEach((p,i)=>p.classList.toggle('active',i==n));"
-"if(n==0)checkStatus();if(n==1)loadConfig();if(n==2)loadWifi();if(n==3)loadFiles();}"
+"if(n==0)checkStatus();if(n==1)loadConfig();if(n==2)loadDeviceConfig();if(n==3)loadWifi();if(n==4)loadFiles();}"
+
+"function initDeviceTab(){"
+"let tabs=document.querySelector('body > div');"
+"if(tabs){tabs.innerHTML=\"<span class='tab active' onclick='showTab(0)'>Stream</span><span class='tab' onclick='showTab(1)'>Captura</span><span class='tab' onclick='showTab(2)'>Configuracion</span><span class='tab' onclick='showTab(3)'>WiFi</span><span class='tab' onclick='showTab(4)'>Archivos</span>\";}"
+"let wifiPanel=document.getElementById('p2');"
+"if(!wifiPanel||document.getElementById('p-device'))return;"
+"let panel=document.createElement('div');"
+"panel.className='panel';"
+"panel.id='p-device';"
+"panel.innerHTML=\"<div class='config-box'><h3>Calidad de la imagen</h3><div class='config-row'><label>Perfil JPEG:</label><select id='img-quality'><option value='10'>Muy alta</option><option value='12'>Alta</option><option value='18'>Media</option><option value='24'>Baja</option><option value='30'>Muy baja</option></select></div><div class='config-row'><label>Resolucion:</label><select id='frame-size'><option value='5'>QVGA (320x240)</option><option value='9'>CIF (400x296)</option><option value='7'>HVGA (480x320)</option><option value='10'>VGA (640x480)</option><option value='11'>SVGA (800x600)</option><option value='12'>XGA (1024x768)</option><option value='13'>HD (1280x720)</option></select></div><p style='color:#888;font-size:0.8em;margin-top:5px'>Menor valor JPEG = mejor calidad. Mayor resolucion = mas detalle y mas carga.</p></div><div class='config-box'><h3>LED incorporado</h3><div class='status' id='led-status'>Cargando...</div><div class='config-row'><button class='btn btn-success' onclick='setLed(true)'>Prender LED</button><button class='btn btn-danger' onclick='setLed(false)'>Apagar LED</button></div><p style='color:#888;font-size:0.8em;margin-top:5px'>Control manual del flash integrado del modulo.</p></div><div style='text-align:center;margin:15px 0'><button class='btn btn-success' onclick='saveDeviceConfig()'>Guardar configuracion</button></div><div class='config-box'><h3>Estado actual</h3><div id='device-status'>Cargando...</div></div>\";"
+"wifiPanel.parentNode.insertBefore(panel,wifiPanel);}"
+
+"function qualityLabel(q){q=parseInt(q,10);if(q<=10)return'Muy alta';if(q<=12)return'Alta';if(q<=18)return'Media';if(q<=24)return'Baja';return'Muy baja';}"
+"function frameSizeLabel(v){v=parseInt(v,10);return frameSizeLabels[v]||('Personalizada ('+v+')');}"
+
+"function showIdleStream(){"
+"let container=document.getElementById('stream-container');"
+"let st=document.getElementById('stream-status');"
+"if(st){st.className='status status-off';st.textContent='ðŸ”´ SIN TRANSMISIÃ“N - Esperando movimiento...';}"
+"if(container){container.innerHTML='<div id=\"stream-placeholder\"><span style=\"font-size:3em\">ðŸ“·</span><p>CÃ¡mara en espera</p><p style=\"color:#888;font-size:0.8em\">El video se activarÃ¡ cuando el sensor detecte movimiento</p></div>';}"
+"}"
+
+"function closeStreamImage(){"
+"let img=document.getElementById('stream');"
+"if(img){img.src='';img.removeAttribute('src');}"
+"}"
 
 "function checkStatus(){let ctrl=new AbortController();setTimeout(()=>ctrl.abort(),2000);"
 "fetch('/api/motion/status',{signal:ctrl.signal,cache:'no-store'}).then(r=>r.json()).then(d=>{"
@@ -355,11 +444,46 @@ static const char* HTML_INDEX =
 "showToast('✅ Configuración guardada','#0a0');"
 "}loadConfig();});}"
 
+"function updateDeviceStatus(d){"
+"deviceLedOn=!!d.led_on;"
+"let qualitySel=document.getElementById('img-quality');"
+"if(qualitySel&&!qualitySel.querySelector('option[value=\"'+d.image_quality+'\"]')){let opt=document.createElement('option');opt.value=String(d.image_quality);opt.textContent='Personalizada ('+d.image_quality+')';qualitySel.appendChild(opt);}"
+"if(qualitySel)qualitySel.value=String(d.image_quality);"
+"let frameSel=document.getElementById('frame-size');"
+"if(frameSel&&!frameSel.querySelector('option[value=\"'+d.frame_size+'\"]')){let opt=document.createElement('option');opt.value=String(d.frame_size);opt.textContent=frameSizeLabel(d.frame_size);frameSel.appendChild(opt);}"
+"if(frameSel)frameSel.value=String(d.frame_size);"
+"let led=document.getElementById('led-status');"
+"if(led){led.className='status '+(deviceLedOn?'status-on':'status-off');led.textContent=deviceLedOn?'LED encendido':'LED apagado';}"
+"let status=document.getElementById('device-status');"
+"if(status){status.innerHTML='<p>Calidad JPEG: <b>'+qualityLabel(d.image_quality)+'</b> (valor '+d.image_quality+')</p><p>Resolucion: <b>'+frameSizeLabel(d.frame_size)+'</b></p><p>LED incorporado: <b>'+(deviceLedOn?'Encendido':'Apagado')+'</b></p>';}}"
+
+"function loadDeviceConfig(){fetch('/api/device/config').then(r=>r.json()).then(d=>updateDeviceStatus(d));}"
+
+"function saveDeviceConfig(){let q=parseInt(document.getElementById('img-quality').value,10);let s=parseInt(document.getElementById('frame-size').value,10);"
+"if(q<10||q>63){showToast('Calidad JPEG invalida','#a00');return;}"
+"fetch('/api/device/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'quality='+q+'&size='+s})"
+".then(r=>r.json()).then(d=>{if(d.ok){updateDeviceStatus(d);showToast('Configuracion guardada','#0a0');}else{showToast('No se pudo guardar','#a00');}})"
+".catch(()=>showToast('Error de conexion','#a00'));}"
+
+"function setLed(on){fetch('/api/device/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'led='+(on?1:0)})"
+".then(r=>r.json()).then(d=>{if(d.ok){updateDeviceStatus(d);showToast(on?'LED encendido':'LED apagado',on?'#0a0':'#444');}else{showToast('No se pudo cambiar el LED','#a00');}})"
+".catch(()=>showToast('Error de conexion','#a00'));}"
+
+"function wifiSignalLabel(rssi){"
+"if(!rssi)return'Sin datos';"
+"if(rssi>=-55)return'Excelente';"
+"if(rssi>=-67)return'Buena';"
+"if(rssi>=-75)return'Regular';"
+"return'Mala';}"
+"function wifiSignalText(d){"
+"if(!d.connected||!d.rssi)return'';"
+"return' | Señal: '+wifiSignalLabel(d.rssi)+' ('+d.rssi+' dBm)';}"
 "function loadWifi(){fetch('/api/wifi/status').then(r=>r.json()).then(d=>{"
 "let st=document.getElementById('wifi-status');"
 "if(d.connected){st.className='status status-on';st.textContent='✅ Conectado a: '+d.ssid;}"
 "else if(d.ap_mode){st.className='status status-warn';st.textContent='📡 Modo AP: '+d.ap_ssid;}"
 "else{st.className='status status-off';st.textContent='❌ Desconectado';}"
+"if(d.connected&&d.rssi){st.textContent+=wifiSignalText(d);}"
 "document.getElementById('wifi-ssid').value=d.ssid||'';"
 "document.getElementById('ap-ssid').value=d.ap_ssid||'';"
 "document.querySelectorAll('input[name=wifi-mode]').forEach(r=>r.checked=(r.value==d.preferred_mode));"
@@ -374,7 +498,7 @@ static const char* HTML_INDEX =
 "'<p>IP: <b>'+d.ip+'</b></p>'+"
 "'<p>Modo actual: <b>'+(d.ap_mode?'📡 Access Point':'📶 Estación')+'</b></p>'+"
 "'<p>Modo preferido: <b>'+(d.preferred_mode==1?'📡 AP (Red propia)':'📶 WiFi (Red externa)')+'</b></p>'+"
-"'<p>'+(d.ap_mode?'AP SSID: <b>'+d.ap_ssid+'</b>':'WiFi SSID: <b>'+d.ssid+'</b>')+'</p>';});}"
+"'<p>'+(d.ap_mode?'AP SSID: <b>'+d.ap_ssid+'</b>':'WiFi SSID: <b>'+d.ssid+'</b>')+'</p>';if(d.connected&&d.rssi){document.getElementById('wifi-info').innerHTML+='<p>Señal WiFi: <b>'+wifiSignalLabel(d.rssi)+'</b> ('+d.rssi+' dBm)</p>';} });}"
 
 "function updateWifiForm(mode){document.getElementById('sta-config').style.display=mode==0?'block':'none';"
 "document.getElementById('ap-config').style.display=mode==1?'block':'none';}"
@@ -492,7 +616,9 @@ static const char* HTML_INDEX =
 "function formatSize(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'KB';return(b/1048576).toFixed(1)+'MB';}"
 "function formatDate(t){let d=new Date(t*1000);return d.toLocaleDateString()+' '+d.toLocaleTimeString();}"
 
-"checkStatus();statusInterval=setInterval(checkStatus,1000);"
+"function stopForce(){forceMode=false;streamActive=false;closeStreamImage();showIdleStream();setTimeout(()=>{fetch('/api/motion/stop',{method:'POST'}).then(r=>r.json()).then(()=>setTimeout(checkStatus,150)).catch(()=>setTimeout(checkStatus,300));},250);}"
+
+"initDeviceTab();checkStatus();statusInterval=setInterval(checkStatus,1000);"
 "</script></body></html>";
 
 // ============================================================================
@@ -973,11 +1099,100 @@ static esp_err_t motion_stop_handler(httpd_req_t *req) {
 // ============================================================================
 
 // Estado y configuración WiFi actual
+static esp_err_t device_config_handler(httpd_req_t *req) {
+    if (req->method == HTTP_GET) {
+        char response[192];
+        snprintf(response, sizeof(response),
+                 "{\"image_quality\":%d,\"frame_size\":%d,\"frame_size_name\":\"%s\",\"led_on\":%s}",
+                 g_image_quality, (int)g_frame_size, cam_hal_get_frame_size_name(g_frame_size),
+                 cam_hal_get_flash_led() ? "true" : "false");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, response);
+        return ESP_OK;
+    }
+
+    char content[96] = {0};
+    int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Sin datos");
+        return ESP_FAIL;
+    }
+
+    char *quality_str = strstr(content, "quality=");
+    char *size_str = strstr(content, "size=");
+    char *led_str = strstr(content, "led=");
+    bool updated = false;
+
+    if (quality_str) {
+        int new_quality = atoi(quality_str + 8);
+        if (new_quality < 10 || new_quality > 63) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Calidad invalida");
+            return ESP_FAIL;
+        }
+
+        esp_err_t err = cam_hal_set_jpeg_quality(new_quality);
+        if (err != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No se pudo aplicar la calidad");
+            return ESP_FAIL;
+        }
+
+        g_image_quality = new_quality;
+        updated = true;
+    }
+
+    if (size_str) {
+        int new_size = atoi(size_str + 5);
+        esp_err_t err = cam_hal_set_frame_size((framesize_t)new_size);
+        if (err != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Resolucion invalida");
+            return ESP_FAIL;
+        }
+
+        g_frame_size = (framesize_t)new_size;
+        updated = true;
+    }
+
+    if (led_str) {
+        int led_value = atoi(led_str + 4);
+        if (led_value != 0 && led_value != 1) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "LED invalido");
+            return ESP_FAIL;
+        }
+
+        esp_err_t err = cam_hal_set_flash_led(led_value == 1);
+        if (err != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No se pudo cambiar el LED");
+            return ESP_FAIL;
+        }
+
+        updated = true;
+    }
+
+    if (!updated) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Parametros invalidos");
+        return ESP_FAIL;
+    }
+
+    if (quality_str || size_str) {
+        save_device_config();
+    }
+
+    char response[224];
+    snprintf(response, sizeof(response),
+             "{\"ok\":true,\"image_quality\":%d,\"frame_size\":%d,\"frame_size_name\":\"%s\",\"led_on\":%s}",
+             g_image_quality, (int)g_frame_size, cam_hal_get_frame_size_name(g_frame_size),
+             cam_hal_get_flash_led() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+
 static esp_err_t wifi_status_handler(httpd_req_t *req) {
-    char response[320];
+    char response[384];
     char ssid[33] = {0};
     char ip[16] = {0};
     char ap_ssid[33] = {0};
+    int rssi = wifi_net_get_rssi();
     
     wifi_net_get_credentials(ssid, sizeof(ssid), NULL, 0);
     wifi_net_get_ip(ip, sizeof(ip));
@@ -986,10 +1201,10 @@ static esp_err_t wifi_status_handler(httpd_req_t *req) {
     int preferred_mode = (int)wifi_net_get_preferred_mode();
     
     snprintf(response, sizeof(response), 
-        "{\"connected\":%s,\"ap_mode\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"ap_ssid\":\"%s\",\"preferred_mode\":%d}",
+        "{\"connected\":%s,\"ap_mode\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"ap_ssid\":\"%s\",\"preferred_mode\":%d,\"rssi\":%d}",
         wifi_net_is_connected() ? "true" : "false",
         wifi_net_is_ap_mode() ? "true" : "false",
-        ssid, ip, ap_ssid, preferred_mode);
+        ssid, ip, ap_ssid, preferred_mode, rssi);
     
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, response);
@@ -1137,13 +1352,14 @@ static esp_err_t wifi_connect_handler(httpd_req_t *req) {
 esp_err_t start_webserver(void) {
     // Cargar configuración de movimiento desde NVS
     load_motion_config();
+    load_device_config();
     
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.task_priority = tskIDLE_PRIORITY + 5;
     config.stack_size = 10240;  // Aumentado para operaciones SD
     config.core_id = 1;
-    config.max_uri_handlers = 20;
+    config.max_uri_handlers = 24;
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 10;  // 10 segundos timeout recepción
     config.send_wait_timeout = 10;  // 10 segundos timeout envío
@@ -1175,6 +1391,8 @@ esp_err_t start_webserver(void) {
     httpd_uri_t uri_motion_config_post = { .uri = "/api/motion/config", .method = HTTP_POST, .handler = motion_config_handler };
     httpd_uri_t uri_motion_force = { .uri = "/api/motion/force", .method = HTTP_POST, .handler = motion_force_handler };
     httpd_uri_t uri_motion_stop = { .uri = "/api/motion/stop", .method = HTTP_POST, .handler = motion_stop_handler };
+    httpd_uri_t uri_device_config_get = { .uri = "/api/device/config", .method = HTTP_GET, .handler = device_config_handler };
+    httpd_uri_t uri_device_config_post = { .uri = "/api/device/config", .method = HTTP_POST, .handler = device_config_handler };
 
     // Endpoints de WiFi
     httpd_uri_t uri_wifi_status = { .uri = "/api/wifi/status", .method = HTTP_GET, .handler = wifi_status_handler };
@@ -1198,6 +1416,8 @@ esp_err_t start_webserver(void) {
     httpd_register_uri_handler(server_httpd, &uri_motion_config_post);
     httpd_register_uri_handler(server_httpd, &uri_motion_force);
     httpd_register_uri_handler(server_httpd, &uri_motion_stop);
+    httpd_register_uri_handler(server_httpd, &uri_device_config_get);
+    httpd_register_uri_handler(server_httpd, &uri_device_config_post);
     httpd_register_uri_handler(server_httpd, &uri_wifi_status);
     httpd_register_uri_handler(server_httpd, &uri_wifi_config);
     httpd_register_uri_handler(server_httpd, &uri_wifi_reset_ap);

@@ -19,6 +19,7 @@ void wifi_net_get_credentials(char *ssid, size_t ssid_len, char *password, size_
 
 // Obtener estado de conexión
 bool wifi_net_is_connected(void);
+int wifi_net_get_rssi(void);
 
 // Obtener IP actual
 void wifi_net_get_ip(char *ip_str, size_t len);

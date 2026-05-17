@@ -1,9 +1,16 @@
 #include "cam_hal.h"
 #include "esp_log.h"
 #include "esp_camera.h"
+#include "driver/gpio.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "CAM_HAL";
+static int s_jpeg_quality = CAM_HAL_DEFAULT_JPEG_QUALITY;
+static framesize_t s_frame_size = CAM_HAL_DEFAULT_FRAME_SIZE;
+static bool s_flash_led_ready = false;
+static bool s_flash_led_on = false;
+
+#define FLASH_LED_GPIO GPIO_NUM_4
 
 // Pines AI-Thinker [cite: 84-100]
 #define PWDN_GPIO_NUM     32
@@ -22,6 +29,47 @@ static const char *TAG = "CAM_HAL";
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
+
+static esp_err_t ensure_flash_led_ready(void) {
+    if (s_flash_led_ready) {
+        return ESP_OK;
+    }
+
+    esp_err_t err = gpio_reset_pin(FLASH_LED_GPIO);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo resetear GPIO del LED flash: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = gpio_set_direction(FLASH_LED_GPIO, GPIO_MODE_OUTPUT);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo configurar GPIO del LED flash: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    gpio_set_level(FLASH_LED_GPIO, 0);
+    s_flash_led_ready = true;
+    s_flash_led_on = false;
+    return ESP_OK;
+}
+
+static bool is_supported_frame_size(framesize_t frame_size) {
+    switch (frame_size) {
+        case FRAMESIZE_QQVGA:
+        case FRAMESIZE_QVGA:
+        case FRAMESIZE_CIF:
+        case FRAMESIZE_HVGA:
+        case FRAMESIZE_VGA:
+        case FRAMESIZE_SVGA:
+        case FRAMESIZE_XGA:
+        case FRAMESIZE_HD:
+        case FRAMESIZE_SXGA:
+        case FRAMESIZE_UXGA:
+            return true;
+        default:
+            return false;
+    }
+}
 
 esp_err_t camera_init_hardware(void) {
     camera_config_t config = {0};
@@ -52,11 +100,11 @@ esp_err_t camera_init_hardware(void) {
     
     // Resolución VGA (640x480) - Balance velocidad/calidad
     // Opciones más rápidas: FRAMESIZE_HVGA (480x320) o FRAMESIZE_CIF (400x296)
-    config.frame_size = FRAMESIZE_VGA; 
+    config.frame_size = s_frame_size;
 
     // JPEG Quality: 12-15 = buena calidad, 18-25 = más velocidad
     // Valor óptimo para streaming fluido
-    config.jpeg_quality = 12;
+    config.jpeg_quality = s_jpeg_quality;
     
 #if CONFIG_SPIRAM
     // OPTIMIZACIÓN: 3 buffers en PSRAM para pipeline DMA sin esperas
@@ -75,5 +123,87 @@ esp_err_t camera_init_hardware(void) {
         ESP_LOGE(TAG, "Fallo al iniciar camara: 0x%x", err);
         return err;
     }
+
+    ensure_flash_led_ready();
     return ESP_OK;
+}
+
+esp_err_t cam_hal_set_jpeg_quality(int quality) {
+    if (quality < 10 || quality > 63) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (!sensor) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (sensor->set_quality(sensor, quality) != 0) {
+        ESP_LOGE(TAG, "No se pudo aplicar calidad JPEG=%d", quality);
+        return ESP_FAIL;
+    }
+
+    s_jpeg_quality = quality;
+    ESP_LOGI(TAG, "Calidad JPEG aplicada: %d", s_jpeg_quality);
+    return ESP_OK;
+}
+
+int cam_hal_get_jpeg_quality(void) {
+    return s_jpeg_quality;
+}
+
+esp_err_t cam_hal_set_frame_size(framesize_t frame_size) {
+    if (!is_supported_frame_size(frame_size)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (!sensor) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (sensor->set_framesize(sensor, frame_size) != 0) {
+        ESP_LOGE(TAG, "No se pudo aplicar frame size=%d", (int)frame_size);
+        return ESP_FAIL;
+    }
+
+    s_frame_size = frame_size;
+    ESP_LOGI(TAG, "Frame size aplicado: %s (%d)", cam_hal_get_frame_size_name(s_frame_size), (int)s_frame_size);
+    return ESP_OK;
+}
+
+framesize_t cam_hal_get_frame_size(void) {
+    return s_frame_size;
+}
+
+const char *cam_hal_get_frame_size_name(framesize_t frame_size) {
+    switch (frame_size) {
+        case FRAMESIZE_QQVGA: return "QQVGA";
+        case FRAMESIZE_QVGA: return "QVGA";
+        case FRAMESIZE_CIF: return "CIF";
+        case FRAMESIZE_HVGA: return "HVGA";
+        case FRAMESIZE_VGA: return "VGA";
+        case FRAMESIZE_SVGA: return "SVGA";
+        case FRAMESIZE_XGA: return "XGA";
+        case FRAMESIZE_HD: return "HD";
+        case FRAMESIZE_SXGA: return "SXGA";
+        case FRAMESIZE_UXGA: return "UXGA";
+        default: return "DESCONOCIDA";
+    }
+}
+
+esp_err_t cam_hal_set_flash_led(bool on) {
+    esp_err_t err = ensure_flash_led_ready();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    gpio_set_level(FLASH_LED_GPIO, on ? 1 : 0);
+    s_flash_led_on = on;
+    ESP_LOGI(TAG, "LED flash %s", on ? "encendido" : "apagado");
+    return ESP_OK;
+}
+
+bool cam_hal_get_flash_led(void) {
+    return s_flash_led_on;
 }
