@@ -61,7 +61,7 @@ static void save_photo_counter(void) {
 
 // Captura foto encriptada y la guarda en SD
 static void capture_encrypted_photo(void) {
-    if (!sd_available) return;
+    if (!sd_card_is_mounted()) return;
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         ESP_LOGE(TAG, "Error capturando foto");
@@ -82,7 +82,7 @@ static void capture_encrypted_photo(void) {
 
 // Captura video MJPEG encriptado
 static void capture_encrypted_video(int duration_sec) {
-    if (!sd_available) return;
+    if (!sd_card_is_mounted()) return;
     ESP_LOGI(TAG, "Iniciando captura de video (%ds)...", duration_sec);
     char filename[32];
     snprintf(filename, sizeof(filename), "VID_%08lu", (unsigned long)photo_counter++);
@@ -133,6 +133,28 @@ static void capture_encrypted_video(int duration_sec) {
     heap_caps_free(video_buffer);
 }
 
+static void capture_current_mode(const char *source, bool keep_photo_delay) {
+    sd_available = sd_card_is_mounted();
+    if (!sd_available) {
+        ESP_LOGW(TAG, "Captura %s ignorada: microSD no disponible", source);
+        return;
+    }
+
+    http_server_set_capture_in_progress(true);
+
+    capture_mode_t mode = http_server_get_capture_mode();
+    if (mode == CAPTURE_MODE_VIDEO) {
+        capture_encrypted_video(http_server_get_video_duration());
+    } else {
+        capture_encrypted_photo();
+        if (keep_photo_delay) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+    }
+
+    http_server_set_capture_in_progress(false);
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "--- ARRANQUE DEL SISTEMA VIGILANTE CON EXPANSOR ---");
@@ -146,6 +168,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     load_photo_counter();
+    ESP_ERROR_CHECK(crypto_init());
 
     // 2. Inicializar Cámara (Esto también habilita el bus I2C)
     if (camera_init_hardware() != ESP_OK) {
@@ -166,7 +189,6 @@ void app_main(void)
         sd_available = false;
     } else {
         sd_available = true;
-        crypto_init();
     }
 
     // 5. Red y Servidor Web
@@ -188,15 +210,7 @@ void app_main(void)
             // Notificar al server para activar stream MJPEG [cite: 205]
             http_server_notify_motion();
             
-            if (sd_available) {
-                capture_mode_t mode = http_server_get_capture_mode();
-                if (mode == CAPTURE_MODE_VIDEO) {
-                    capture_encrypted_video(http_server_get_video_duration());
-                } else {
-                    capture_encrypted_photo();
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                }
-            }
+            capture_current_mode("por movimiento", true);
             
             // Mantener luz IR activa un tiempo
             vTaskDelay(pdMS_TO_TICKS(5000));

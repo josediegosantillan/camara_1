@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd \"c:\\\\Users\\\\diego\\\\OneDrive\\\\Escritorio\\\\camara\" && find components/http_server -type f 2>nul)",
+      "Bash(python3 -c ' *)",
+      "Bash(python -c ' *)",
+      "Read(//c/Espressif/**)",
+      "PowerShell(Get-Command idf.py -ErrorAction SilentlyContinue)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\diego\\OneDrive\\Escritorio\\camara"
+    ]
+  }
+}

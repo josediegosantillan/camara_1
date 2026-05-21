@@ -38,3 +38,10 @@ capture_mode_t http_server_get_capture_mode(void);
 
 // Obtener duración de video configurada (en segundos)
 int http_server_get_video_duration(void);
+
+// Solicitud de captura manual desde la web
+bool http_server_take_manual_capture_request(void);
+
+// Estado de captura en curso para coordinar la UI web
+void http_server_set_capture_in_progress(bool in_progress);
+bool http_server_is_capture_in_progress(void);

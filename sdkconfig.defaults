@@ -25,3 +25,9 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # Permitir headers más grandes y respuesta rápida
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_ERR_RESP_NO_DELAY=y
+
+# Permitir nombres con fecha y hora, por ejemplo IMG_20260519_143012.jpg
+# en la microSD.
+# CONFIG_FATFS_LFN_NONE is not set
+CONFIG_FATFS_LFN_STACK=y
+CONFIG_FATFS_MAX_LFN=64

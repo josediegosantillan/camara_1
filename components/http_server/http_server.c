@@ -1,4 +1,4 @@
-#include "http_server.h"
+﻿#include "http_server.h"
 #include "esp_http_server.h"
 #include "esp_camera.h"
 #include "esp_log.h"
@@ -14,12 +14,21 @@
 #include "sd_hal.h"
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+#include <errno.h>
 
 static const char *TAG = "WEB_SERVER";
 static httpd_handle_t server_httpd = NULL;
+static uint32_t s_manual_capture_fallback_counter = 0;
+static char s_manual_capture_stamp[20] = {0};
+static volatile uint32_t s_manual_capture_result_id = 0;
+static volatile bool s_manual_capture_last_ok = false;
+static char s_manual_capture_last_file[64] = {0};
+static char s_manual_capture_last_msg[96] = {0};
 
 // ============================================================================
 // CONFIGURACIÓN
@@ -51,6 +60,8 @@ static volatile int g_emission_time_sec = DEFAULT_EMISSION_TIME; // Tiempo de em
 static volatile bool g_force_stream = false;          // Forzar stream desde web (vista en vivo manual)
 static volatile int64_t g_force_end_time = 0;         // Timestamp cuando termina vista en vivo
 static volatile int g_live_time_sec = DEFAULT_LIVE_TIME; // Tiempo de vista en vivo configurable
+static volatile bool g_manual_capture_requested = false;
+static volatile bool g_capture_in_progress = false;
 
 // Modo de captura (foto vs video)
 static volatile capture_mode_t g_capture_mode = CAPTURE_MODE_PHOTO;
@@ -218,6 +229,148 @@ int http_server_get_emission_time(void) {
     return g_emission_time_sec;
 }
 
+bool http_server_take_manual_capture_request(void) {
+    if (!g_manual_capture_requested) {
+        return false;
+    }
+
+    g_manual_capture_requested = false;
+    return true;
+}
+
+void http_server_set_capture_in_progress(bool in_progress) {
+    g_capture_in_progress = in_progress;
+}
+
+bool http_server_is_capture_in_progress(void) {
+    return g_capture_in_progress;
+}
+
+static void set_manual_capture_result(bool ok, const char *message, const char *filename) {
+    s_manual_capture_last_ok = ok;
+
+    if (message) {
+        strncpy(s_manual_capture_last_msg, message, sizeof(s_manual_capture_last_msg) - 1);
+        s_manual_capture_last_msg[sizeof(s_manual_capture_last_msg) - 1] = '\0';
+    } else {
+        s_manual_capture_last_msg[0] = '\0';
+    }
+
+    if (filename) {
+        strncpy(s_manual_capture_last_file, filename, sizeof(s_manual_capture_last_file) - 1);
+        s_manual_capture_last_file[sizeof(s_manual_capture_last_file) - 1] = '\0';
+    } else {
+        s_manual_capture_last_file[0] = '\0';
+    }
+
+    s_manual_capture_result_id++;
+}
+
+static bool is_valid_capture_stamp(const char *stamp) {
+    if (!stamp || strlen(stamp) != 14 ||
+        stamp[2] != '_' || stamp[5] != '_' || stamp[8] != '_' || stamp[11] != '_') {
+        return false;
+    }
+
+    for (int i = 0; i < 14; i++) {
+        if (i == 2 || i == 5 || i == 8 || i == 11) {
+            continue;
+        }
+        if (stamp[i] < '0' || stamp[i] > '9') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void build_manual_capture_filename(char *filename, size_t filename_len, const char *preferred_stamp) {
+    if (is_valid_capture_stamp(preferred_stamp)) {
+        snprintf(filename, filename_len, "IMG_%s.jpg", preferred_stamp);
+        return;
+    }
+
+    time_t now = 0;
+    struct tm timeinfo = {0};
+
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    if (timeinfo.tm_year >= (2024 - 1900)) {
+        strftime(filename, filename_len, "IMG_%d_%m_%y_%H_%M.jpg", &timeinfo);
+        return;
+    }
+
+    snprintf(filename, filename_len, "IMG_NOCLK_%04lu.jpg",
+             (unsigned long)(s_manual_capture_fallback_counter++ % 10000));
+}
+
+static esp_err_t save_manual_capture_frame(const uint8_t *data, size_t len) {
+    if (!sd_card_is_mounted()) {
+        ESP_LOGW(TAG, "Captura manual ignorada: SD no montada");
+        set_manual_capture_result(false, "microSD no montada", NULL);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char filename[64];
+    char filepath[128];
+    char preferred_stamp[sizeof(s_manual_capture_stamp)] = {0};
+
+    if (s_manual_capture_stamp[0] != '\0') {
+        strncpy(preferred_stamp, s_manual_capture_stamp, sizeof(preferred_stamp) - 1);
+        s_manual_capture_stamp[0] = '\0';
+    }
+
+    build_manual_capture_filename(filename, sizeof(filename), preferred_stamp);
+
+    snprintf(filepath, sizeof(filepath), "%s/%s", MOUNT_POINT, filename);
+
+    for (int suffix = 1; suffix <= 99; suffix++) {
+        struct stat st;
+        if (stat(filepath, &st) != 0) {
+            break;
+        }
+
+        time_t now = 0;
+        struct tm timeinfo = {0};
+        if (is_valid_capture_stamp(preferred_stamp)) {
+            snprintf(filename, sizeof(filename), "IMG_%s_%02d.jpg", preferred_stamp, suffix);
+        } else {
+            time(&now);
+            localtime_r(&now, &timeinfo);
+            if (timeinfo.tm_year >= (2024 - 1900)) {
+                strftime(filename, sizeof(filename), "IMG_%d_%m_%y_%H_%M", &timeinfo);
+                snprintf(filename + strlen(filename), sizeof(filename) - strlen(filename), "_%02d.jpg", suffix);
+            } else {
+                snprintf(filename, sizeof(filename), "IMG_NOCLK_%04lu_%02d.jpg",
+                         (unsigned long)(s_manual_capture_fallback_counter % 10000), suffix);
+            }
+        }
+        snprintf(filepath, sizeof(filepath), "%s/%s", MOUNT_POINT, filename);
+    }
+
+    FILE *f = fopen(filepath, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "No se pudo crear captura manual %s (errno=%d)", filepath, errno);
+        set_manual_capture_result(false, "no se pudo crear el archivo en la SD", NULL);
+        return ESP_FAIL;
+    }
+
+    size_t written = fwrite(data, 1, len, f);
+    fclose(f);
+
+    if (written != len) {
+        ESP_LOGE(TAG, "Escritura incompleta de captura manual: %u/%u bytes",
+                 (unsigned)written, (unsigned)len);
+        set_manual_capture_result(false, "escritura incompleta en la SD", filename);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Captura manual guardada: %s (%u bytes)", filename, (unsigned)len);
+    set_manual_capture_result(true, "guardado", filename);
+    return ESP_OK;
+}
+
 // Boundary para MJPEG
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
@@ -235,215 +388,330 @@ typedef struct {
 // ============================================================================
 // PÁGINA HTML PRINCIPAL (Con control de movimiento, WiFi y modo captura)
 // ============================================================================
-static const char* HTML_INDEX = 
-"<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>Vigilante ESP32</title><style>"
+static const char* HTML_INDEX =
+"<!DOCTYPE html><html lang='es'><head>"
+"<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>Camara Vigia</title><style>"
+":root{--bg:#0d1117;--sf:#161b22;--sf2:#1c2128;--br:#30363d;--ac:#58a6ff;--gr:#3fb950;--rd:#f85149;--yl:#d29922;--tx:#e6edf3;--mt:#8b949e;--sw:640px;--sh:360px}"
 "*{box-sizing:border-box;margin:0;padding:0}"
-"body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;padding:10px}"
-"h1{color:#0f0;font-size:1.2em;margin-bottom:10px}"
-".btn{background:#16213e;border:1px solid #0f3460;color:#eee;padding:8px 12px;margin:3px;cursor:pointer;border-radius:4px;text-decoration:none;display:inline-block;font-size:0.9em}"
-".btn:hover{background:#0f3460}.btn-danger{background:#a00;border-color:#f00}"
-".btn-danger:hover{background:#c00}.btn-success{background:#0a0;border-color:#0f0}"
-"#stream{width:100%;max-width:640px;border:2px solid #0f3460;margin:10px 0}"
-"#stream-placeholder{width:100%;max-width:640px;height:300px;border:2px solid #0f3460;margin:10px 0;display:flex;align-items:center;justify-content:center;background:#0a0a1a;flex-direction:column}"
-".files{margin-top:15px}.file{background:#16213e;padding:8px;margin:5px 0;border-radius:4px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap}"
-".file-name{flex:1;min-width:150px;word-break:break-all;cursor:pointer}.file-name:hover{color:#4af}.file-info{color:#888;font-size:0.8em;margin:0 10px}"
-".file-actions{display:flex;gap:5px}"
-"#viewer-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.95);z-index:1000;align-items:center;justify-content:center;flex-direction:column}"
-"#viewer-modal.show{display:flex}"
-"#viewer-close{position:absolute;top:20px;right:30px;font-size:40px;color:#fff;cursor:pointer;z-index:1001}"
-"#viewer-close:hover{color:#f00}"
-"#viewer-content{max-width:90%;max-height:80%;display:flex;align-items:center;justify-content:center}"
-"#viewer-img{max-width:100%;max-height:80vh;border:2px solid #0f3460}"
-"#viewer-title{color:#fff;font-size:1.2em;margin-bottom:10px}"
-"#viewer-nav{display:flex;gap:20px;margin-top:15px}"
-"#viewer-nav button{padding:10px 20px;font-size:1em}"
-".tab{display:inline-block;padding:10px 15px;cursor:pointer;background:#16213e;border-radius:4px 4px 0 0}"
-".tab.active{background:#0f3460}.panel{display:none;padding:15px;background:#16213e;border-radius:0 4px 4px 4px}"
-".panel.active{display:block}.status{padding:5px 10px;border-radius:4px;margin:5px 0;font-size:0.85em}"
-".status-on{background:#0a0}.status-off{background:#a00}.status-warn{background:#a60}"
-".config-box{background:#0a0a1a;padding:15px;border-radius:8px;margin:10px 0}"
+"body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:var(--bg);color:var(--tx);padding:12px}"
+"h1{color:var(--ac);font-size:1.3em;margin-bottom:12px}"
+".tabs{display:flex;gap:2px;border-bottom:2px solid var(--br);overflow-x:auto;margin-bottom:0}"
+".tab{padding:10px 14px;cursor:pointer;color:var(--mt);font-size:.88em;white-space:nowrap;border-bottom:2px solid transparent;margin-bottom:-2px;transition:color .2s,border-color .2s}"
+".tab:hover{color:var(--tx)}.tab.active{color:var(--ac);border-bottom-color:var(--ac)}"
+".panel{display:none;padding:16px;background:var(--sf);border:1px solid var(--br);border-top:none;border-radius:0 0 6px 6px;animation:fadeIn .15s}"
+".panel.active{display:block}"
+".btn{background:var(--sf2);border:1px solid var(--br);color:var(--tx);padding:7px 14px;margin:3px 2px;cursor:pointer;border-radius:6px;font-size:.88em;transition:all .15s;display:inline-flex;align-items:center;gap:5px;text-decoration:none}"
+".btn:hover{background:#21262d;border-color:#8b949e}"
+".btn-success{background:#1a4731;border-color:var(--gr);color:#3fb950}.btn-success:hover{background:#1f5c3c}"
+".btn-danger{background:#3d1515;border-color:var(--rd);color:#f85149}.btn-danger:hover{background:#5c1a1a}"
+".btn-primary{background:#1c3353;border-color:var(--ac);color:var(--ac)}.btn-primary:hover{background:#1f3a5f}"
+".btn-group{display:flex;flex-wrap:wrap;gap:4px;margin:10px 0}"
+".status{padding:6px 12px;border-radius:20px;margin:6px 0;font-size:.85em;font-weight:600;display:inline-flex;align-items:center;gap:6px}"
+".status-on{background:#1a4731;color:#3fb950;border:1px solid #1f5c3c}"
+".status-off{background:#3d1515;color:#f85149;border:1px solid #5c1a1a}"
+".status-warn{background:#3d2f00;color:#d29922;border:1px solid #5c4400}"
+".card{background:var(--sf2);padding:14px 16px;border-radius:8px;margin:10px 0;border:1px solid var(--br);box-shadow:0 1px 3px rgba(0,0,0,.3)}"
+".card-title{font-size:.95em;font-weight:600;margin-bottom:10px}"
+"#stream{width:100%;max-width:var(--sw);border-radius:6px;border:1px solid var(--br);display:block;margin:10px 0}"
+"#stream-placeholder{width:100%;max-width:var(--sw);height:var(--sh);border-radius:6px;border:1px solid var(--br);margin:10px 0;display:flex;align-items:center;justify-content:center;background:#0a0e16;flex-direction:column;gap:8px;color:var(--mt)}"
+"#stream-timer{font-size:.85em;color:var(--mt);margin:2px 0 6px}"
+"#stream-timer b{color:var(--ac)}"
+".progress-bar{width:100%;max-width:var(--sw);height:4px;background:var(--br);border-radius:2px;margin:0 0 10px;overflow:hidden}"
+".progress-fill{height:100%;background:var(--ac);border-radius:2px;transition:width 1s linear}"
 ".config-row{display:flex;align-items:center;gap:10px;margin:10px 0;flex-wrap:wrap}"
-".config-row label{min-width:150px}.config-row input,.config-row select{padding:8px;border-radius:4px;border:1px solid #0f3460;background:#16213e;color:#eee;width:180px}"
-".config-row input[type=number]{width:80px}"
-".radio-group{display:flex;gap:15px;margin:10px 0}.radio-group label{display:flex;align-items:center;gap:5px;cursor:pointer;min-width:auto}"
-".pass-container{position:relative;display:inline-flex;align-items:center}.pass-toggle{position:absolute;right:8px;background:none;border:none;color:#888;cursor:pointer;font-size:1.1em;padding:0}.pass-toggle:hover{color:#fff}"
-"@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.2);opacity:0.7}}"
+".config-row label{min-width:140px;color:var(--mt);font-size:.9em}"
+".config-row input,.config-row select{padding:7px 10px;border-radius:6px;border:1px solid var(--br);background:var(--sf);color:var(--tx);font-size:.9em;outline:none;transition:border-color .2s}"
+".config-row input:focus,.config-row select:focus{border-color:var(--ac)}"
+".config-row input[type=number]{width:88px}.config-row select{min-width:180px}"
+".hint{color:var(--mt);font-size:.8em;margin-top:4px}"
+".radio-group{display:flex;gap:16px;margin:8px 0;flex-wrap:wrap}"
+".radio-group label{display:flex;align-items:center;gap:5px;cursor:pointer;font-size:.9em}"
+".file{background:var(--sf2);padding:10px 12px;margin:6px 0;border-radius:6px;border:1px solid var(--br);display:flex;align-items:center;flex-wrap:wrap;gap:6px;transition:border-color .15s}"
+".file:hover{border-color:#4a5568}"
+".file-name{flex:1;min-width:140px;word-break:break-all;cursor:pointer;font-size:.9em}"
+".file-name:hover{color:var(--ac)}"
+".file-info{color:var(--mt);font-size:.78em}.file-actions{display:flex;gap:4px;flex-shrink:0}"
+".capture-status{display:none;max-width:var(--sw);margin:10px 0;padding:12px 14px;border-radius:6px;font-size:.9em;font-weight:600}"
+".capture-status.show{display:block}"
+".capture-status.saving{border:1px solid #d29922;background:#3d2f00;color:#f0c040}"
+".capture-status.ok{border:1px solid var(--gr);background:#1a4731;color:#56d364}"
+".capture-status.error{border:1px solid var(--rd);background:#3d1515;color:#ff8080}"
+".pass-container{position:relative;display:inline-flex;align-items:center}"
+".pass-toggle{position:absolute;right:8px;background:none;border:none;color:var(--mt);cursor:pointer;font-size:1em;padding:0}"
+".pass-toggle:hover{color:var(--tx)}"
+"#viewer-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.96);z-index:1000;align-items:center;justify-content:center;flex-direction:column}"
+"#viewer-modal.show{display:flex}"
+"#viewer-close{position:absolute;top:16px;right:24px;font-size:1.5em;color:#fff;cursor:pointer;z-index:1001;background:rgba(255,255,255,.1);border-radius:50%;width:40px;height:40px;display:flex;align-items:center;justify-content:center}"
+"#viewer-close:hover{background:rgba(255,255,255,.2)}"
+"#viewer-img{max-width:90vw;max-height:78vh;border-radius:4px;border:1px solid var(--br)}"
+"#viewer-title{color:#ccc;font-size:.95em;margin-bottom:10px;max-width:90vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+"#viewer-nav{display:flex;gap:12px;margin-top:14px}"
+"hr{border:none;border-top:1px solid var(--br);margin:14px 0}"
+"@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}"
+"@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}"
 "</style></head><body>"
-"<h1>🎥 Cámara Vigía</h1>"
-"<div><span class='tab active' onclick='showTab(0)'>📹 Stream</span><span class='tab' onclick='showTab(1)'>⚙️ Captura</span><span class='tab' onclick='showTab(2)'>📶 WiFi</span><span class='tab' onclick='showTab(3)'>📁 Archivos</span></div>"
-
+"<h1>🎥 Camara Vigia</h1>"
+"<div class='tabs'>"
+"<span class='tab active' onclick='showTab(0)'>📹 Stream</span>"
+"<span class='tab' onclick='showTab(1)'>⚙️ Captura</span>"
+"<span class='tab' onclick='showTab(2)'>🖥 Config</span>"
+"<span class='tab' onclick='showTab(3)'>📶 WiFi</span>"
+"<span class='tab' onclick='showTab(4)'>📁 Archivos</span>"
+"</div>"
 "<div class='panel active' id='p0'>"
-"<div class='status' id='stream-status'>Verificando...</div>"
+"<div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px'>"
+"<div class='status status-off' id='stream-status'>Verificando...</div>"
+"</div>"
+"<div id='stream-timer' style='display:none'>Tiempo restante: <b id='timer-val'>--</b>s</div>"
+"<div id='progress-container' style='display:none'><div class='progress-bar'><div class='progress-fill' id='progress-fill'></div></div></div>"
 "<div id='stream-container'></div>"
+"<div class='btn-group'>"
 "<button class='btn btn-success' id='btn-live' onclick='forceStream()'>🔴 Ver en Vivo</button>"
-"<button class='btn' onclick='stopForce()'>⏹️ Detener</button>"
+"<button class='btn btn-primary' id='btn-capture' onclick='captureNow()' disabled>📸 Capturar</button>"
+"<button class='btn' onclick='stopForce()'>⏹ Detener</button>"
 "<button class='btn' onclick='checkStatus()'>🔄 Actualizar</button>"
 "</div>"
-
+"<div id='capture-status' class='capture-status'></div>"
+"</div>"
 "<div class='panel' id='p1'>"
-"<div class='config-box'>"
-"<h3>📷 Modo de Captura</h3>"
+"<div class='card'>"
+"<div class='card-title'>📷 Modo de Captura</div>"
 "<div class='radio-group'>"
 "<label><input type='radio' name='cap-mode' value='0' checked> 📸 Foto</label>"
 "<label><input type='radio' name='cap-mode' value='1'> 🎬 Video</label>"
 "</div>"
 "<div id='video-opts' style='display:none'>"
-"<div class='config-row'><label>Duración video:</label><input type='number' id='vid-dur' min='5' max='60' value='10'><span style='color:#888'>segundos</span></div>"
-"<p style='color:#888;font-size:0.8em'>Graba secuencia de frames como video MJPEG. Mín 5s, máx 60s.</p>"
+"<div class='config-row'><label>Duracion video:</label><input type='number' id='vid-dur' min='5' max='60' value='10'><span class='hint'>seg (5-60)</span></div>"
 "</div>"
 "</div>"
-"<div class='config-box'>"
-"<h3>⏱️ Tiempo de Emisión tras Movimiento</h3>"
+"<div class='card'>"
+"<div class='card-title'>⏱ Tiempo tras Movimiento</div>"
 "<div class='config-row'><label>Segundos:</label><input type='number' id='emit-time' min='5' max='300' value='30'></div>"
-"<p style='color:#888;font-size:0.8em;margin-top:5px'>Tiempo de streaming cuando el PIR detecta movimiento. Mín 5s, máx 300s.</p>"
+"<p class='hint'>Duracion del stream al detectar movimiento PIR. (5-300s)</p>"
 "</div>"
-"<div class='config-box'>"
-"<h3>🔴 Tiempo de Vista en Vivo</h3>"
+"<div class='card'>"
+"<div class='card-title'>🔴 Tiempo Vista en Vivo</div>"
 "<div class='config-row'><label>Segundos:</label><input type='number' id='live-time' min='10' max='600' value='60'></div>"
-"<p style='color:#888;font-size:0.8em;margin-top:5px'>Tiempo máximo de transmisión manual. Mín 10s, máx 600s.</p>"
+"<p class='hint'>Duracion maxima del stream manual. (10-600s)</p>"
 "</div>"
-"<div style='text-align:center;margin:15px 0'><button class='btn btn-success' onclick='saveConfig()'>💾 Guardar Configuración</button></div>"
-"<div class='config-box'><h3>📊 Estado Actual</h3><div id='config-status'>Cargando...</div></div>"
+"<div style='text-align:center;margin:14px 0'><button class='btn btn-success' onclick='saveConfig()'>💾 Guardar Configuracion</button></div>"
+"<div class='card'><div class='card-title'>📊 Estado Actual</div><div id='config-status'>Cargando...</div></div>"
 "</div>"
-
 "<div class='panel' id='p2'>"
-"<div class='status' id='wifi-status'>Cargando...</div>"
-"<div class='config-box'>"
-"<h3>� Modo de Red</h3>"
+"<div class='card'>"
+"<div class='card-title'>🖼 Calidad de Imagen</div>"
+"<div class='config-row'><label>Perfil JPEG:</label>"
+"<select id='img-quality'>"
+"<option value='10'>Muy alta</option><option value='12'>Alta</option>"
+"<option value='18'>Media</option><option value='24'>Baja</option>"
+"<option value='30'>Muy baja</option>"
+"</select></div>"
+"<div class='config-row'><label>Resolucion:</label>"
+"<select id='frame-size'>"
+"<option value='5'>QVGA (320x240)</option><option value='9'>CIF (400x296)</option>"
+"<option value='7'>HVGA (480x320)</option><option value='10'>VGA (640x480)</option>"
+"<option value='11'>SVGA (800x600)</option><option value='12'>XGA (1024x768)</option>"
+"<option value='13'>HD (1280x720)</option>"
+"</select></div>"
+"<p class='hint'>Menor valor JPEG = mejor calidad. Mayor resolucion = mas detalle.</p>"
+"</div>"
+"<div class='card'>"
+"<div class='card-title'>📐 Tamano de Vista en Vivo</div>"
+"<div class='config-row'><label>Tamano:</label>"
+"<select id='live-view-size' onchange='previewLiveViewSize()'>"
+"<option value='sm'>Compacta (360px)</option><option value='md'>Mediana (480px)</option>"
+"<option value='lg'>Grande (640px)</option><option value='xl'>Extra grande (800px)</option>"
+"<option value='full'>Ancho completo</option>"
+"</select></div>"
+"</div>"
+"<div class='card'>"
+"<div class='card-title'>💡 LED Incorporado</div>"
+"<div class='status status-off' id='led-status'>Cargando...</div>"
+"<div class='btn-group'>"
+"<button class='btn btn-success' onclick='setLed(true)'>💡 Encender LED</button>"
+"<button class='btn btn-danger' onclick='setLed(false)'>Apagar LED</button>"
+"</div>"
+"</div>"
+"<div style='text-align:center;margin:14px 0'><button class='btn btn-success' onclick='saveDeviceConfig()'>💾 Guardar Configuracion</button></div>"
+"<div class='card'><div class='card-title'>📊 Estado Actual</div><div id='device-status'>Cargando...</div></div>"
+"</div>"
+"<div class='panel' id='p3'>"
+"<div class='status status-off' id='wifi-status'>Cargando...</div>"
+"<div class='card'>"
+"<div class='card-title'>📡 Modo de Red</div>"
 "<div class='radio-group'>"
 "<label><input type='radio' name='wifi-mode' value='0'> 📶 WiFi (conectar a red)</label>"
 "<label><input type='radio' name='wifi-mode' value='1'> 📡 AP (crear red propia)</label>"
 "</div>"
 "</div>"
-"<div id='sta-config' class='config-box'>"
-"<h3>📶 Configurar WiFi (Estación)</h3>"
-"<div class='config-row'><label>SSID (Red):</label><input type='text' id='wifi-ssid' maxlength='32' placeholder='Nombre de red WiFi' pattern='[a-zA-Z0-9\\s\\-_]*' title='Permite letras, números, espacios y guiones'></div>"
-"<div class='config-row'><label>Contraseña:</label><div class='pass-container'><input type='password' id='wifi-pass' maxlength='64' placeholder='Contraseña WiFi'><button type='button' class='pass-toggle' onclick='togglePass(\"wifi-pass\")'>👁️</button></div></div>"
+"<div id='sta-config' class='card'>"
+"<div class='card-title'>📶 Configurar WiFi (Estacion)</div>"
+"<div class='config-row'><label>SSID:</label><input type='text' id='wifi-ssid' maxlength='32' placeholder='Nombre de red WiFi'></div>"
+"<div class='config-row'><label>Contrasena:</label><div class='pass-container'><input type='password' id='wifi-pass' maxlength='64' placeholder='Contrasena WiFi' style='padding-right:36px'><button type='button' class='pass-toggle' onclick='togglePass(\"wifi-pass\")'>👁</button></div></div>"
 "</div>"
-"<div id='ap-config' class='config-box' style='display:none'>"
-"<h3>📡 Configurar Access Point</h3>"
-"<div class='config-row'><label>Nombre de Red:</label><input type='text' id='ap-ssid' maxlength='32' placeholder='Nombre del AP' pattern='[a-zA-Z0-9\\s\\-_]*' title='Permite letras, números, espacios y guiones'></div>"
-"<div class='config-row'><label>Contraseña:</label><div class='pass-container'><input type='password' id='ap-pass' maxlength='64' placeholder='Contraseña (mín 8 chars)'><button type='button' class='pass-toggle' onclick='togglePass(\"ap-pass\")'>👁️</button></div></div>"
-"<p style='color:#888;font-size:0.8em'>IP del dispositivo en modo AP: 192.168.4.1</p>"
-"<button class='btn btn-danger' onclick='resetApCredentials()' style='margin-top:10px'>🔄 Resetear a valores por defecto</button>"
+"<div id='ap-config' class='card' style='display:none'>"
+"<div class='card-title'>📡 Configurar Access Point</div>"
+"<div class='config-row'><label>Nombre de Red:</label><input type='text' id='ap-ssid' maxlength='32' placeholder='Nombre del AP'></div>"
+"<div class='config-row'><label>Contrasena:</label><div class='pass-container'><input type='password' id='ap-pass' maxlength='64' placeholder='Contrasena (min 8 chars)' style='padding-right:36px'><button type='button' class='pass-toggle' onclick='togglePass(\"ap-pass\")'>👁</button></div></div>"
+"<p class='hint'>IP del dispositivo en modo AP: 192.168.4.1</p>"
+"<button class='btn btn-danger' onclick='resetApCredentials()' style='margin-top:8px'>🔄 Restablecer a valores por defecto</button>"
 "</div>"
-"<div style='text-align:center;margin:15px 0'>"
+"<div class='btn-group'>"
 "<button class='btn btn-success' onclick='saveWifi()'>💾 Guardar WiFi</button>"
-"<button class='btn' onclick='tryConnectWifi()' style='background:#06a'>📶 Conectar a WiFi</button>"
+"<button class='btn btn-primary' onclick='tryConnectWifi()'>📶 Conectar a WiFi</button>"
 "<button class='btn btn-danger' onclick='restartDevice()'>🔄 Reiniciar</button>"
 "</div>"
-"<p style='color:#f80;font-size:0.8em'>⚠️ Guarda la config primero, luego presiona 'Conectar a WiFi' para intentar conexión.</p>"
-"<div class='config-box'><h3>✅ Datos Guardados</h3><div id='wifi-saved-data' style='background:#0a0a1a;padding:10px;border-radius:4px;border-left:4px solid #0f0'></div></div>"
-"<div class='config-box'><h3>ℹ️ Info Actual</h3><div id='wifi-info'>Cargando...</div></div>"
+"<p class='hint' style='color:var(--yl)'>Guarda la config primero, luego presiona Conectar.</p>"
+"<div class='card'><div class='card-title'>✅ Datos Guardados</div><div id='wifi-saved-data' style='background:var(--bg);padding:10px;border-radius:4px;border-left:3px solid var(--gr)'></div></div>"
+"<div class='card'><div class='card-title'>Informacion Actual</div><div id='wifi-info'>Cargando...</div></div>"
 "</div>"
-
-"<div class='panel' id='p3'><div class='status' id='files-status'>Cargando...</div>"
+"<div class='panel' id='p4'>"
+"<div style='display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:10px'>"
+"<div class='status' id='files-status'>Cargando...</div>"
+"</div>"
+"<div class='btn-group'>"
 "<button class='btn' onclick='loadFiles()'>🔄 Actualizar</button>"
-"<button class='btn' onclick='mountSd()' style='background:#2a5'>💾 Montar SD</button>"
-"<button class='btn btn-danger' onclick='deleteAll()'>🗑️ Borrar Todo</button>"
-"<div class='config-box'>"
-"<h3>Formatear microSD (FAT32)</h3>"
-"<div class='status status-warn' id='format-warning'>ADVERTENCIA: Esto borra TODOS los archivos. No desconectes la camara durante el formateo.</div>"
-"<p style='color:#888;font-size:0.8em;margin-top:5px'>Usalo solo cuando la tarjeta tenga errores o antes de empezar un nuevo ciclo.</p>"
-"<button class='btn btn-danger' onclick='formatSd()' style='margin-top:8px'>Formatear microSD</button>"
+"<button class='btn' onclick='mountSd()'>💾 Montar SD</button>"
+"<button class='btn btn-danger' onclick='deleteAll()'>🗑 Borrar Todo</button>"
+"</div>"
+"<div class='card'>"
+"<div class='card-title'>Formatear microSD (FAT32)</div>"
+"<div class='status status-warn'>ADVERTENCIA: Esto borra TODOS los archivos. No desconectes la camara durante el formateo.</div>"
+"<p class='hint' style='margin:6px 0'>Usar solo cuando la tarjeta tenga errores o antes de un nuevo ciclo.</p>"
+"<button class='btn btn-danger' onclick='formatSd()' style='margin-top:6px'>Formatear microSD</button>"
 "<div class='status' id='format-result' style='display:none;margin-top:8px'></div>"
 "</div>"
-"<div class='files' id='files'></div></div>"
-
+"<div class='files' id='files'></div>"
+"</div>"
 "<div id='viewer-modal'>"
 "<span id='viewer-close' onclick='closeViewer()'>&times;</span>"
 "<div id='viewer-title'></div>"
-"<div id='viewer-content'>"
-"<img id='viewer-img' src='' alt='Visor'>"
-"</div>"
+"<div id='viewer-content'><img id='viewer-img' src='' alt='Visor'></div>"
 "<div id='viewer-nav'>"
-"<button class='btn' onclick='viewerPrev()'>⬅️ Anterior</button>"
-"<button class='btn' onclick='viewerDownload()'>⬇️ Descargar</button>"
-"<button class='btn' onclick='viewerNext()'>Siguiente ➡️</button>"
+"<button class='btn' onclick='viewerPrev()'>← Anterior</button>"
+"<button class='btn' onclick='viewerDownload()'>⬇ Descargar</button>"
+"<button class='btn' onclick='viewerNext()'>Siguiente →</button>"
 "</div>"
 "</div>"
-
 "<script>"
 "let streamActive=false,forceMode=false,statusInterval=null;"
 "let viewerFiles=[],viewerIndex=0;"
 "let deviceLedOn=false;"
+"let captureResultSeen=0;"
 "let frameSizeLabels={5:'QVGA',7:'HVGA',9:'CIF',10:'VGA',11:'SVGA',12:'XGA',13:'HD'};"
-
+"let liveViewSizeLabels={sm:'Compacta',md:'Mediana',lg:'Grande',xl:'Extra grande',full:'Ancho completo'};"
 "document.querySelectorAll('input[name=cap-mode]').forEach(r=>r.addEventListener('change',e=>{"
 "document.getElementById('video-opts').style.display=e.target.value=='1'?'block':'none';}));"
-
 "function showTab(n){document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',i==n));"
 "document.querySelectorAll('.panel').forEach((p,i)=>p.classList.toggle('active',i==n));"
 "if(n==0)checkStatus();if(n==1)loadConfig();if(n==2)loadDeviceConfig();if(n==3)loadWifi();if(n==4)loadFiles();}"
-
-"function initDeviceTab(){"
-"let tabs=document.querySelector('body > div');"
-"if(tabs){tabs.innerHTML=\"<span class='tab active' onclick='showTab(0)'>Stream</span><span class='tab' onclick='showTab(1)'>Captura</span><span class='tab' onclick='showTab(2)'>Configuracion</span><span class='tab' onclick='showTab(3)'>WiFi</span><span class='tab' onclick='showTab(4)'>Archivos</span>\";}"
-"let wifiPanel=document.getElementById('p2');"
-"if(!wifiPanel||document.getElementById('p-device'))return;"
-"let panel=document.createElement('div');"
-"panel.className='panel';"
-"panel.id='p-device';"
-"panel.innerHTML=\"<div class='config-box'><h3>Calidad de la imagen</h3><div class='config-row'><label>Perfil JPEG:</label><select id='img-quality'><option value='10'>Muy alta</option><option value='12'>Alta</option><option value='18'>Media</option><option value='24'>Baja</option><option value='30'>Muy baja</option></select></div><div class='config-row'><label>Resolucion:</label><select id='frame-size'><option value='5'>QVGA (320x240)</option><option value='9'>CIF (400x296)</option><option value='7'>HVGA (480x320)</option><option value='10'>VGA (640x480)</option><option value='11'>SVGA (800x600)</option><option value='12'>XGA (1024x768)</option><option value='13'>HD (1280x720)</option></select></div><p style='color:#888;font-size:0.8em;margin-top:5px'>Menor valor JPEG = mejor calidad. Mayor resolucion = mas detalle y mas carga.</p></div><div class='config-box'><h3>LED incorporado</h3><div class='status' id='led-status'>Cargando...</div><div class='config-row'><button class='btn btn-success' onclick='setLed(true)'>Prender LED</button><button class='btn btn-danger' onclick='setLed(false)'>Apagar LED</button></div><p style='color:#888;font-size:0.8em;margin-top:5px'>Control manual del flash integrado del modulo.</p></div><div style='text-align:center;margin:15px 0'><button class='btn btn-success' onclick='saveDeviceConfig()'>Guardar configuracion</button></div><div class='config-box'><h3>Estado actual</h3><div id='device-status'>Cargando...</div></div>\";"
-"wifiPanel.parentNode.insertBefore(panel,wifiPanel);}"
-
 "function qualityLabel(q){q=parseInt(q,10);if(q<=10)return'Muy alta';if(q<=12)return'Alta';if(q<=18)return'Media';if(q<=24)return'Baja';return'Muy baja';}"
 "function frameSizeLabel(v){v=parseInt(v,10);return frameSizeLabels[v]||('Personalizada ('+v+')');}"
-
+"function liveViewSizeLabel(v){return liveViewSizeLabels[v]||liveViewSizeLabels.lg;}"
+"function applyLiveViewSize(v){"
+"let presets={sm:['360px','220px'],md:['480px','270px'],lg:['640px','360px'],xl:['800px','450px'],full:['100%','min(56vw,520px)']};"
+"let key=presets[v]?v:'lg';"
+"document.documentElement.style.setProperty('--sw',presets[key][0]);"
+"document.documentElement.style.setProperty('--sh',presets[key][1]);"
+"let sel=document.getElementById('live-view-size');if(sel)sel.value=key;"
+"return key;}"
+"function previewLiveViewSize(){"
+"let sel=document.getElementById('live-view-size');"
+"let key=applyLiveViewSize(sel?sel.value:'lg');"
+"try{localStorage.setItem('live-view-size',key);}catch(e){}"
+"let status=document.getElementById('device-status');"
+"if(status&&status.dataset.imageQuality&&status.dataset.frameSize){updateDeviceStatus({image_quality:parseInt(status.dataset.imageQuality,10),frame_size:parseInt(status.dataset.frameSize,10),led_on:status.dataset.ledOn==='true'});}"
+"}"
+"function loadLiveViewSize(){"
+"let saved='lg';try{saved=localStorage.getItem('live-view-size')||'lg';}catch(e){}"
+"return applyLiveViewSize(saved);}"
 "function showIdleStream(){"
 "let container=document.getElementById('stream-container');"
 "let st=document.getElementById('stream-status');"
-"if(st){st.className='status status-off';st.textContent='ðŸ”´ SIN TRANSMISIÃ“N - Esperando movimiento...';}"
-"if(container){container.innerHTML='<div id=\"stream-placeholder\"><span style=\"font-size:3em\">ðŸ“·</span><p>CÃ¡mara en espera</p><p style=\"color:#888;font-size:0.8em\">El video se activarÃ¡ cuando el sensor detecte movimiento</p></div>';}"
-"}"
-
+"if(st){st.className='status status-off';st.textContent='Sin transmision - Esperando movimiento...';}"
+"if(container){container.innerHTML='<div id=\"stream-placeholder\"><span style=\"font-size:3em\">📷</span><p>Camara en espera</p><p style=\"color:var(--mt);font-size:.85em\">El video se activara cuando el sensor detecte movimiento</p></div>';}"
+"let timer=document.getElementById('stream-timer');if(timer)timer.style.display='none';"
+"let prog=document.getElementById('progress-container');if(prog)prog.style.display='none';}"
 "function closeStreamImage(){"
 "let img=document.getElementById('stream');"
-"if(img){img.src='';img.removeAttribute('src');}"
-"}"
-
+"if(img){img.src='';img.removeAttribute('src');}}"
+"function updateCaptureButton(active,busy,mode){"
+"let btn=document.getElementById('btn-capture');"
+"if(!btn)return;"
+"btn.textContent='📸 Capturar';"
+"btn.disabled=!active||busy;"
+"btn.style.opacity=btn.disabled?'0.5':'1';"
+"btn.title=!active?'Disponible solo con streaming activo':(busy?'Hay una captura en curso':'');}"
+"function setCaptureNotice(kind,msg){"
+"let el=document.getElementById('capture-status');"
+"if(!el)return;el.className='capture-status show '+kind;el.textContent=msg;}"
+"function refreshCaptureNotice(d){"
+"if(d.manual_pending||d.capture_busy){setCaptureNotice('saving','Guardando captura en la microSD...');return;}"
+"if(d.capture_result_id&&d.capture_result_id!==captureResultSeen){"
+"captureResultSeen=d.capture_result_id;"
+"if(d.capture_last_ok){setCaptureNotice('ok','Guardado: '+(d.capture_last_file||'imagen JPG'));loadFiles();}"
+"else{setCaptureNotice('error','Error al guardar: '+(d.capture_last_msg||'sin detalle'));}}}"
 "function checkStatus(){let ctrl=new AbortController();setTimeout(()=>ctrl.abort(),2000);"
 "fetch('/api/motion/status',{signal:ctrl.signal,cache:'no-store'}).then(r=>r.json()).then(d=>{"
-"streamActive=d.active;let st=document.getElementById('stream-status');"
+"streamActive=d.active;"
+"let st=document.getElementById('stream-status');"
 "let container=document.getElementById('stream-container');"
+"let timer=document.getElementById('stream-timer');"
+"let timerVal=document.getElementById('timer-val');"
+"let prog=document.getElementById('progress-container');"
+"let fill=document.getElementById('progress-fill');"
 "if(d.active){"
 "let modeStr=d.is_live?' (Vista en vivo)':' (Movimiento)';"
-"st.className='status status-on';st.textContent='🟢 TRANSMITIENDO'+modeStr;"
+"st.className='status status-on';st.textContent='Transmitiendo'+modeStr;"
+"if(timer){timer.style.display='';if(timerVal)timerVal.textContent=d.remaining;}"
+"if(prog)prog.style.display='';"
+"if(fill&&d.emission_time>0)fill.style.width=Math.max(0,Math.min(100,100*d.remaining/d.emission_time))+'%';"
 "if(!container.innerHTML||container.innerHTML.indexOf('placeholder')>-1){"
 "container.innerHTML='<img id=\"stream\" src=\"/stream?t='+Date.now()+'\" alt=\"Video\">';}"
 "}else{"
-"st.className='status status-off';st.textContent='🔴 SIN TRANSMISIÓN - Esperando movimiento...';"
-"container.innerHTML='<div id=\"stream-placeholder\"><span style=\"font-size:3em\">📷</span><p>Cámara en espera</p><p style=\"color:#888;font-size:0.8em\">El video se activará cuando el sensor detecte movimiento</p></div>';"
-"}}).catch(e=>{if(e.name!=='AbortError')console.error(e);});}"
-
+"st.className='status status-off';st.textContent='Sin transmision - Esperando movimiento...';"
+"if(timer)timer.style.display='none';"
+"if(prog)prog.style.display='none';"
+"container.innerHTML='<div id=\"stream-placeholder\"><span style=\"font-size:3em\">📷</span><p>Camara en espera</p><p style=\"color:var(--mt);font-size:.85em\">El video se activara cuando el sensor detecte movimiento</p></div>';}"
+"updateCaptureButton(d.active,!!d.capture_busy||!!d.manual_pending,d.capture_mode);"
+"refreshCaptureNotice(d);"
+"}).catch(e=>{if(e.name!=='AbortError')console.error(e);});}"
 "function forceStream(){fetch('/api/motion/force',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.ok){forceMode=true;checkStatus();}});}"
-"function stopForce(){fetch('/api/motion/stop',{method:'POST'}).then(r=>r.json()).then(d=>checkStatus());}"
-
+"function captureStamp(){let d=new Date();let p=n=>String(n).padStart(2,'0');return p(d.getDate())+'_'+p(d.getMonth()+1)+'_'+String(d.getFullYear()).slice(-2)+'_'+p(d.getHours())+'_'+p(d.getMinutes());}"
+"function captureNow(){"
+"if(!streamActive){showToast('Activa Ver en vivo o espera movimiento','#a00');return;}"
+"let btn=document.getElementById('btn-capture');"
+"if(btn){btn.disabled=true;btn.style.opacity='0.5';}"
+"setCaptureNotice('saving','Pausando video y guardando captura...');"
+"closeStreamImage();"
+"setTimeout(()=>{"
+"fetch('/api/capture/manual',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'epoch='+Math.floor(Date.now()/1000)+'&stamp='+captureStamp()}).then(r=>r.json()).then(d=>{"
+"if(d.ok){setCaptureNotice('ok','Guardado: '+(d.file||'imagen JPG'));loadFiles();}"
+"else{showToast('Error: '+(d.error||'No se pudo capturar'),'#a00');}"
+"}).catch(()=>{setCaptureNotice('error','Error de conexion con la camara');}).finally(()=>setTimeout(checkStatus,600));"
+"},250);}"
 "function loadConfig(){fetch('/api/motion/config').then(r=>r.json()).then(d=>{"
 "document.getElementById('emit-time').value=d.emission_time;"
 "document.getElementById('live-time').value=d.live_time;"
 "document.getElementById('vid-dur').value=d.video_duration||10;"
 "document.querySelectorAll('input[name=cap-mode]').forEach(r=>r.checked=(r.value==d.capture_mode));"
 "document.getElementById('video-opts').style.display=d.capture_mode==1?'block':'none';"
-"let modeStr=d.capture_mode==1?'🎬 Video ('+d.video_duration+'s)':'📸 Foto';"
+"let modeStr=d.capture_mode==1?'Video ('+d.video_duration+'s)':'Foto';"
 "document.getElementById('config-status').innerHTML="
-"'<p>Modo: <b>'+modeStr+'</b></p>'+"
-"'<p>⏱️ Movimiento: <b>'+d.emission_time+'</b>s | 🔴 En vivo: <b>'+d.live_time+'</b>s</p>'+"
-"'<p>Estado: '+(d.active?'<span style=\"color:#0f0\">Transmitiendo</span>':'<span style=\"color:#f00\">En espera</span>')+'</p>';});}"
-
+"'<p>Modo: <b>'+modeStr+'</b></p>'"
+"+'<p>Movimiento: <b>'+d.emission_time+'</b>s | En vivo: <b>'+d.live_time+'</b>s</p>'"
+"+'<p>Estado: '+(d.active?'<span style=\"color:var(--gr)\">Transmitiendo</span>':'<span style=\"color:var(--rd)\">En espera</span>')+'</p>';});}"
 "function saveConfig(){let t=parseInt(document.getElementById('emit-time').value);"
 "let l=parseInt(document.getElementById('live-time').value);"
 "let m=document.querySelector('input[name=cap-mode]:checked').value;"
 "let v=parseInt(document.getElementById('vid-dur').value);"
-"if(t<5||t>300){showToast('❌ Tiempo movimiento: 5-300s','#a00');return;}"
-"if(l<10||l>600){showToast('❌ Tiempo en vivo: 10-600s','#a00');return;}"
-"if(m==1&&(v<5||v>60)){showToast('❌ Duración video: 5-60s','#a00');return;}"
+"if(t<5||t>300){showToast('Tiempo movimiento: 5-300s','#a00');return;}"
+"if(l<10||l>600){showToast('Tiempo en vivo: 10-600s','#a00');return;}"
+"if(m==1&&(v<5||v>60)){showToast('Duracion video: 5-60s','#a00');return;}"
 "fetch('/api/motion/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
 "body:'time='+t+'&live='+l+'&mode='+m+'&vdur='+v}).then(r=>r.json()).then(d=>{if(d.ok){"
-"showToast('✅ Configuración guardada','#0a0');"
-"}loadConfig();});}"
-
+"showToast('Configuracion guardada','#0a0');}loadConfig();});}"
 "function updateDeviceStatus(d){"
 "deviceLedOn=!!d.led_on;"
 "let qualitySel=document.getElementById('img-quality');"
@@ -454,146 +722,114 @@ static const char* HTML_INDEX =
 "if(frameSel)frameSel.value=String(d.frame_size);"
 "let led=document.getElementById('led-status');"
 "if(led){led.className='status '+(deviceLedOn?'status-on':'status-off');led.textContent=deviceLedOn?'LED encendido':'LED apagado';}"
+"let liveViewSize=loadLiveViewSize();"
 "let status=document.getElementById('device-status');"
-"if(status){status.innerHTML='<p>Calidad JPEG: <b>'+qualityLabel(d.image_quality)+'</b> (valor '+d.image_quality+')</p><p>Resolucion: <b>'+frameSizeLabel(d.frame_size)+'</b></p><p>LED incorporado: <b>'+(deviceLedOn?'Encendido':'Apagado')+'</b></p>';}}"
-
+"if(status){status.dataset.imageQuality=String(d.image_quality);status.dataset.frameSize=String(d.frame_size);status.dataset.ledOn=String(!!d.led_on);"
+"status.innerHTML='<p>Calidad JPEG: <b>'+qualityLabel(d.image_quality)+'</b> (valor '+d.image_quality+')</p><p>Resolucion: <b>'+frameSizeLabel(d.frame_size)+'</b></p><p>Vista en vivo: <b>'+liveViewSizeLabel(liveViewSize)+'</b></p><p>LED: <b>'+(deviceLedOn?'Encendido':'Apagado')+'</b></p>';}}"
 "function loadDeviceConfig(){fetch('/api/device/config').then(r=>r.json()).then(d=>updateDeviceStatus(d));}"
-
 "function saveDeviceConfig(){let q=parseInt(document.getElementById('img-quality').value,10);let s=parseInt(document.getElementById('frame-size').value,10);"
 "if(q<10||q>63){showToast('Calidad JPEG invalida','#a00');return;}"
 "fetch('/api/device/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'quality='+q+'&size='+s})"
 ".then(r=>r.json()).then(d=>{if(d.ok){updateDeviceStatus(d);showToast('Configuracion guardada','#0a0');}else{showToast('No se pudo guardar','#a00');}})"
 ".catch(()=>showToast('Error de conexion','#a00'));}"
-
 "function setLed(on){fetch('/api/device/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'led='+(on?1:0)})"
 ".then(r=>r.json()).then(d=>{if(d.ok){updateDeviceStatus(d);showToast(on?'LED encendido':'LED apagado',on?'#0a0':'#444');}else{showToast('No se pudo cambiar el LED','#a00');}})"
 ".catch(()=>showToast('Error de conexion','#a00'));}"
-
 "function wifiSignalLabel(rssi){"
-"if(!rssi)return'Sin datos';"
-"if(rssi>=-55)return'Excelente';"
-"if(rssi>=-67)return'Buena';"
-"if(rssi>=-75)return'Regular';"
-"return'Mala';}"
-"function wifiSignalText(d){"
-"if(!d.connected||!d.rssi)return'';"
-"return' | Señal: '+wifiSignalLabel(d.rssi)+' ('+d.rssi+' dBm)';}"
+"if(!rssi)return'Sin datos';if(rssi>=-55)return'Excelente';if(rssi>=-67)return'Buena';if(rssi>=-75)return'Regular';return'Mala';}"
 "function loadWifi(){fetch('/api/wifi/status').then(r=>r.json()).then(d=>{"
 "let st=document.getElementById('wifi-status');"
-"if(d.connected){st.className='status status-on';st.textContent='✅ Conectado a: '+d.ssid;}"
-"else if(d.ap_mode){st.className='status status-warn';st.textContent='📡 Modo AP: '+d.ap_ssid;}"
-"else{st.className='status status-off';st.textContent='❌ Desconectado';}"
-"if(d.connected&&d.rssi){st.textContent+=wifiSignalText(d);}"
+"if(d.connected){st.className='status status-on';st.textContent='Conectado a: '+d.ssid;}"
+"else if(d.ap_mode){st.className='status status-warn';st.textContent='Modo AP: '+d.ap_ssid;}"
+"else{st.className='status status-off';st.textContent='Desconectado';}"
+"if(d.connected&&d.rssi){st.textContent+=' | Senal: '+wifiSignalLabel(d.rssi)+' ('+d.rssi+' dBm)';}"
 "document.getElementById('wifi-ssid').value=d.ssid||'';"
 "document.getElementById('ap-ssid').value=d.ap_ssid||'';"
 "document.querySelectorAll('input[name=wifi-mode]').forEach(r=>r.checked=(r.value==d.preferred_mode));"
 "updateWifiForm(d.preferred_mode);"
-"let modeStr=d.preferred_mode==0?'📶 WiFi (Estación)':'📡 Access Point';"
+"let modeStr=d.preferred_mode==0?'WiFi (Estacion)':'Access Point';"
 "let savedSsid=d.preferred_mode==0?d.ssid:d.ap_ssid;"
 "document.getElementById('wifi-saved-data').innerHTML="
-"'<p style=\"margin:5px 0\"><b>Modo:</b> '+modeStr+'</p>'+"
-"'<p style=\"margin:5px 0\"><b>SSID guardado:</b> '+(savedSsid||'(no configurado)')+'</p>'+"
-"'<p style=\"margin:5px 0;color:#f80\">ℹ️ Los datos fueron guardados en la memoria del dispositivo</p>';"
+"'<p><b>Modo:</b> '+modeStr+'</p>'"
+"+'<p><b>SSID guardado:</b> '+(savedSsid||'(no configurado)')+'</p>'"
+"+'<p style=\"color:var(--yl)\">Los datos estan guardados en la memoria del dispositivo</p>';"
 "document.getElementById('wifi-info').innerHTML="
-"'<p>IP: <b>'+d.ip+'</b></p>'+"
-"'<p>Modo actual: <b>'+(d.ap_mode?'📡 Access Point':'📶 Estación')+'</b></p>'+"
-"'<p>Modo preferido: <b>'+(d.preferred_mode==1?'📡 AP (Red propia)':'📶 WiFi (Red externa)')+'</b></p>'+"
-"'<p>'+(d.ap_mode?'AP SSID: <b>'+d.ap_ssid+'</b>':'WiFi SSID: <b>'+d.ssid+'</b>')+'</p>';if(d.connected&&d.rssi){document.getElementById('wifi-info').innerHTML+='<p>Señal WiFi: <b>'+wifiSignalLabel(d.rssi)+'</b> ('+d.rssi+' dBm)</p>';} });}"
-
+"'<p>IP: <b>'+d.ip+'</b></p>'"
+"+'<p>Modo actual: <b>'+(d.ap_mode?'Access Point':'Estacion')+'</b></p>'"
+"+'<p>Modo preferido: <b>'+(d.preferred_mode==1?'AP (Red propia)':'WiFi (Red externa)')+'</b></p>'"
+"+'<p>'+(d.ap_mode?'AP SSID: <b>'+d.ap_ssid+'</b>':'WiFi SSID: <b>'+d.ssid+'</b>')+'</p>';"
+"if(d.connected&&d.rssi){document.getElementById('wifi-info').innerHTML+='<p>Senal WiFi: <b>'+wifiSignalLabel(d.rssi)+'</b> ('+d.rssi+' dBm)</p>';} });}"
 "function updateWifiForm(mode){document.getElementById('sta-config').style.display=mode==0?'block':'none';"
 "document.getElementById('ap-config').style.display=mode==1?'block':'none';}"
-
 "document.querySelectorAll('input[name=wifi-mode]').forEach(r=>r.addEventListener('change',e=>updateWifiForm(e.target.value)));"
-
 "function saveWifi(){let mode=document.querySelector('input[name=wifi-mode]:checked').value;"
 "let s,p;"
 "if(mode=='0'){s=document.getElementById('wifi-ssid').value.trim();p=document.getElementById('wifi-pass').value;}"
 "else{s=document.getElementById('ap-ssid').value.trim();p=document.getElementById('ap-pass').value;}"
-"if(!s||s.length<1||s.length>32){showToast('❌ SSID inválido (1-32 caracteres)','#a00');return;}"
-"if(p.length>0&&p.length<8){showToast('❌ Contraseña muy corta (mín 8)','#a00');return;}"
+"if(!s||s.length<1||s.length>32){showToast('SSID invalido (1-32 caracteres)','#a00');return;}"
+"if(p.length>0&&p.length<8){showToast('Contrasena muy corta (min 8)','#a00');return;}"
 "fetch('/api/wifi/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
 "body:'mode='+mode+'&ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)}).then(r=>r.json()).then(d=>{"
-"if(d.ok){showToast('✅ Configuración guardada\\nReinicie para aplicar','#0a0');"
-"let modeStr=mode==0?'📶 WiFi (Estación)':'📡 Access Point';"
-"let passDisplay=p?'••••••••':'(vacía)';"
-"document.getElementById('wifi-saved-data').innerHTML="
-"'<p style=\"margin:5px 0\"><b>Modo:</b> '+modeStr+'</p>'+"
-"'<p style=\"margin:5px 0\"><b>SSID:</b> '+s+'</p>'+"
-"'<p style=\"margin:5px 0\"><b>Contraseña:</b> '+passDisplay+'</p>'+"
-"'<p style=\"margin:5px 0;color:#0f0\">✅ Guardado correctamente</p>';"
-"loadWifi();}"
-"else{showToast('❌ Error guardando','#a00');}});}"
-
-"function restartDevice(){if(confirm('¿Reiniciar el dispositivo?')){"
-"fetch('/api/restart',{method:'POST'}).then(()=>showToast('🔄 Reiniciando...','#06a'));}}"
-
+"if(d.ok){showToast('Configuracion guardada','#0a0');loadWifi();}"
+"else{showToast('Error guardando','#a00');}});}"
+"function restartDevice(){if(confirm('Reiniciar el dispositivo?')){"
+"fetch('/api/restart',{method:'POST'}).then(()=>showToast('Reiniciando...','#06a'));}}"
 "function togglePass(id){let inp=document.getElementById(id);if(inp.type==='password'){inp.type='text';}else{inp.type='password';}}"
-
-"function resetApCredentials(){if(confirm('¿Restaurar credenciales AP a valores por defecto?\\n\\nSSID: CamaraVigia_AP\\nContraseña: seguridad123')){"
+"function resetApCredentials(){if(confirm('Restaurar credenciales AP a valores por defecto?\\n\\nSSID: CamaraVigia_AP\\nContrasena: seguridad123')){"
 "fetch('/api/wifi/reset_ap',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.ok){"
-"showToast('✅ Credenciales AP reseteadas\\nReinicie para aplicar','#0a0');loadWifi();}"
-"else{showToast('❌ Error reseteando','#a00');}});}}"
-
-"function tryConnectWifi(){showToast('📶 Intentando conectar a WiFi...','#06a');"
+"showToast('Credenciales AP reseteadas','#0a0');loadWifi();}"
+"else{showToast('Error reseteando','#a00');}});}}"
+"function tryConnectWifi(){showToast('Intentando conectar a WiFi...','#06a');"
 "fetch('/api/wifi/connect',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.ok){"
 "showConnectingBanner();checkWifiConnection(0);}"
-"else{showToast('❌ Error: '+d.error,'#a00');}});}"
-
+"else{showToast('Error: '+d.error,'#a00');}});}"
 "function showConnectingBanner(){let b=document.createElement('div');b.id='connect-banner';"
-"b.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.85);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:10000';"
-"b.innerHTML='<div style=\"font-size:4em;animation:pulse 1s infinite\">📶</div><h2 style=\"color:#fff;margin:20px\">Conectando a WiFi...</h2><p id=\"connect-status\" style=\"color:#888\">Intento 1 de 10</p><p style=\"color:#666;font-size:0.8em\">Por favor espera...</p>';"
+"b.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.9);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:10000';"
+"b.innerHTML='<div style=\"font-size:4em;animation:pulse 1s infinite\">📶</div><h2 style=\"color:#fff;margin:20px\">Conectando a WiFi...</h2><p id=\"connect-status\" style=\"color:#888\">Intento 1 de 10</p><p style=\"color:#666;font-size:.8em\">Por favor espera...</p>';"
 "document.body.appendChild(b);}"
-
 "function checkWifiConnection(attempt){if(attempt>=10){"
 "document.getElementById('connect-banner').remove();"
-"showToast('❌ No se pudo conectar\\nVerifica las credenciales','#a00');loadWifi();return;}"
+"showToast('No se pudo conectar. Verifica las credenciales.','#a00');loadWifi();return;}"
 "document.getElementById('connect-status').textContent='Intento '+(attempt+1)+' de 10';"
 "fetch('/api/wifi/status').then(r=>r.json()).then(d=>{if(d.connected){"
-"document.getElementById('connect-banner').innerHTML='<div style=\"font-size:4em\">✅</div><h2 style=\"color:#0f0;margin:20px\">¡CONECTADO!</h2><p style=\"color:#fff;font-size:1.2em\">Red: <b>'+d.ssid+'</b></p><p style=\"color:#0f0;font-size:1.5em\">IP: '+d.ip+'</p><p style=\"color:#888;margin-top:20px\">Esta ventana se cerrará en 3 segundos...</p>';"
+"document.getElementById('connect-banner').innerHTML='<div style=\"font-size:4em\">✅</div><h2 style=\"color:var(--gr);margin:20px\">CONECTADO!</h2><p style=\"color:#fff;font-size:1.2em\">Red: <b>'+d.ssid+'</b></p><p style=\"color:var(--gr);font-size:1.5em\">IP: '+d.ip+'</p><p style=\"color:#888;margin-top:20px\">Esta ventana se cerrara en 3 segundos...</p>';"
 "setTimeout(()=>{document.getElementById('connect-banner').remove();loadWifi();},3000);}"
 "else{setTimeout(()=>checkWifiConnection(attempt+1),2000);}});}"
-
 "function showToast(msg,bg){let toast=document.createElement('div');"
-"toast.style.cssText='position:fixed;top:20px;left:50%;transform:translateX(-50%);background:'+(bg||'#0a0')+';color:#fff;padding:15px 25px;border-radius:8px;z-index:9999;font-size:1em;white-space:pre-line;text-align:center;box-shadow:0 4px 15px rgba(0,0,0,0.3);animation:fadeIn 0.3s';"
+"toast.style.cssText='position:fixed;top:20px;left:50%;transform:translateX(-50%);background:'+(bg||'#0a0')+';color:#fff;padding:14px 22px;border-radius:8px;z-index:9999;font-size:.9em;white-space:pre-line;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,.5);animation:fadeIn .2s';"
 "toast.textContent=msg;document.body.appendChild(toast);"
-"setTimeout(()=>{toast.style.opacity='0';toast.style.transition='opacity 0.5s';setTimeout(()=>toast.remove(),500);},3000);}"
-
+"setTimeout(()=>{toast.style.opacity='0';toast.style.transition='opacity 0.4s';setTimeout(()=>toast.remove(),400);},3000);}"
 "function setFormatResult(msg,cls){let el=document.getElementById('format-result');"
-"if(!el)return;el.style.display='block';el.className='status '+cls;el.textContent=msg;}"
-
+"if(!el)return;el.style.display='flex';el.className='status '+cls;el.textContent=msg;}"
 "function formatSd(){"
-"let warn='FORMATEAR microSD?\\n\\nSe borraran TODOS los archivos.\\nNo desconectes la camara durante el proceso.';"
-"if(!confirm(warn))return;"
+"if(!confirm('FORMATEAR microSD?\\n\\nSe borraran TODOS los archivos.\\nNo desconectes la camara durante el proceso.'))return;"
 "setFormatResult('Formateando microSD...','status-warn');"
 "fetch('/api/format_sd',{method:'POST'}).then(r=>r.json()).then(d=>{"
-"if(d&&d.ok){setFormatResult('RESULTADO: Formateo completo','status-on');loadFiles();return;}"
+"if(d&&d.ok){setFormatResult('Formateo completado','status-on');loadFiles();return;}"
 "let err=(d&&d.error)?d.error:'no se pudo formatear';"
 "if(err==='ESP_ERR_INVALID_STATE')err='No se puede formatear durante streaming/captura';"
 "if(err==='ESP_ERR_TIMEOUT')err='Tiempo agotado. Revisa microSD y conexiones.';"
 "if(err==='ESP_ERR_NOT_SUPPORTED')err='MKFS no habilitado en FATFS';"
-"setFormatResult('RESULTADO: Error - '+err,'status-off');"
-"}).catch(()=>{setFormatResult('RESULTADO: Error de conexion','status-off');});}"
-
-
+"setFormatResult('Error: '+err,'status-off');"
+"}).catch(()=>{setFormatResult('Error de conexion','status-off');});}"
 "function loadFiles(){fetch('/api/files').then(r=>r.json()).then(d=>{"
 "if(d.error){"
 "document.getElementById('files-status').className='status status-off';"
 "document.getElementById('files-status').textContent=d.error;"
 "document.getElementById('files').innerHTML='';viewerFiles=[];return;}"
 "document.getElementById('files-status').className='status status-on';"
-"document.getElementById('files-status').textContent='Encontrados: '+d.count+' archivos ('+formatSize(d.total_size)+')';"
+"document.getElementById('files-status').textContent=d.count+' archivos ('+formatSize(d.total_size)+')';"
 "viewerFiles=d.files;"
 "let h='';d.files.forEach((f,i)=>{"
 "let icon=f.name.startsWith('VID_')?'🎬':'📷';"
 "h+='<div class=\"file\"><span class=\"file-name\" onclick=\"openViewer('+i+')\">'+icon+' '+f.name+'</span>';"
 "h+='<span class=\"file-info\">'+formatSize(f.size)+' | '+formatDate(f.mtime)+'</span>';"
-"h+='<div class=\"file-actions\"><button class=\"btn\" onclick=\"openViewer('+i+')\">👁️</button>';"
-"h+='<a class=\"btn\" href=\"/file?name='+encodeURIComponent(f.name)+'\" download>⬇️</a>';"
-"h+='<button class=\"btn btn-danger\" onclick=\"deleteFile(\\''+f.name+'\\');\">🗑️</button></div></div>';});"
-"document.getElementById('files').innerHTML=h||'<p>No hay archivos guardados</p>';}).catch(e=>{"
+"h+='<div class=\"file-actions\"><button class=\"btn\" onclick=\"openViewer('+i+')\">👁</button>';"
+"h+='<a class=\"btn\" href=\"/file?name='+encodeURIComponent(f.name)+'\" download>⬇</a>';"
+"h+='<button class=\"btn btn-danger\" onclick=\"deleteFile(\\''+f.name+'\\');\">🗑</button></div></div>';});"
+"document.getElementById('files').innerHTML=h||'<p style=\"color:var(--mt);padding:10px\">No hay archivos guardados</p>';}).catch(()=>{"
 "document.getElementById('files-status').className='status status-off';"
-"document.getElementById('files-status').textContent='❌ Error de conexión';});}"
-
+"document.getElementById('files-status').textContent='Error de conexion';});}"
 "function openViewer(idx){viewerIndex=idx;let f=viewerFiles[idx];if(!f)return;"
 "document.getElementById('viewer-title').textContent=f.name+' ('+formatSize(f.size)+')';"
 "document.getElementById('viewer-img').src='/file?name='+encodeURIComponent(f.name);"
@@ -604,21 +840,19 @@ static const char* HTML_INDEX =
 "function viewerDownload(){let f=viewerFiles[viewerIndex];if(f)window.open('/file?name='+encodeURIComponent(f.name),'_blank');}"
 "document.addEventListener('keydown',e=>{if(document.getElementById('viewer-modal').classList.contains('show')){"
 "if(e.key==='Escape')closeViewer();if(e.key==='ArrowLeft')viewerPrev();if(e.key==='ArrowRight')viewerNext();}});"
-
-"function deleteFile(n){if(confirm('¿Borrar '+n+'?'))fetch('/api/delete?name='+encodeURIComponent(n),{method:'DELETE'})"
-".then(r=>r.json()).then(d=>{if(d&&d.ok){loadFiles();closeViewer();}else{alert('Error: '+(d.error||'No se pudo borrar'));}}).catch(()=>alert('Error de conexión'));}"
-"function mountSd(){document.getElementById('files-status').textContent='Montando SD...';"
-"fetch('/api/sd/reinit',{method:'POST'}).then(r=>r.json()).then(d=>{if(d&&d.ok){showToast('SD montada');loadFiles();}"
-"else{alert('Error: '+(d.error||'No se pudo montar'));}}).catch(()=>alert('Error de conexi\u00f3n'));"
-"document.getElementById('files-status').textContent='Listo';}"
-"function deleteAll(){if(confirm('¿BORRAR TODOS los archivos?'))fetch('/api/delete_all',{method:'DELETE'})"
-".then(r=>r.json()).then(d=>{if(d&&d.ok){loadFiles();showToast('Borrados '+d.deleted+' archivos');}else{alert('Error: '+(d.error||'No se pudo borrar'));}}).catch(()=>alert('Error de conexión'));}"
+"function deleteFile(n){if(confirm('Borrar '+n+'?'))fetch('/api/delete?name='+encodeURIComponent(n),{method:'DELETE'})"
+".then(r=>r.json()).then(d=>{if(d&&d.ok){loadFiles();closeViewer();showToast('Archivo borrado','#444');}else{showToast('Error: '+(d.error||'No se pudo borrar'),'#a00');}}).catch(()=>showToast('Error de conexion con la camara','#a00'));}"
+"function mountSd(){if(streamActive){showToast('Detener transmision antes de montar SD','#a60');return;}"
+"document.getElementById('files-status').textContent='Montando SD...';"
+"fetch('/api/sd/reinit',{method:'POST'}).then(r=>r.json()).then(d=>{if(d&&d.ok){showToast('SD montada','#0a0');loadFiles();}"
+"else{showToast('Error: '+(d.error||'No se pudo montar'),'#a00');document.getElementById('files-status').textContent=d.error||'No se pudo montar';}}).catch(()=>{showToast('Error de conexion con la camara','#a00');document.getElementById('files-status').textContent='Error de conexion';});}"
+"function deleteAll(){if(confirm('BORRAR TODOS los archivos?'))fetch('/api/delete_all',{method:'DELETE'})"
+".then(r=>r.json()).then(d=>{if(d&&d.ok){loadFiles();showToast('Borrados '+d.deleted+' archivos','#444');}else{showToast('Error: '+(d.error||'No se pudo borrar'),'#a00');}}).catch(()=>showToast('Error de conexion con la camara','#a00'));}"
 "function formatSize(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'KB';return(b/1048576).toFixed(1)+'MB';}"
 "function formatDate(t){let d=new Date(t*1000);return d.toLocaleDateString()+' '+d.toLocaleTimeString();}"
-
-"function stopForce(){forceMode=false;streamActive=false;closeStreamImage();showIdleStream();setTimeout(()=>{fetch('/api/motion/stop',{method:'POST'}).then(r=>r.json()).then(()=>setTimeout(checkStatus,150)).catch(()=>setTimeout(checkStatus,300));},250);}"
-
-"initDeviceTab();checkStatus();statusInterval=setInterval(checkStatus,1000);"
+"function stopForce(){forceMode=false;streamActive=false;closeStreamImage();showIdleStream();"
+"setTimeout(()=>{fetch('/api/motion/stop',{method:'POST'}).then(r=>r.json()).then(()=>setTimeout(checkStatus,150)).catch(()=>setTimeout(checkStatus,300));},250);}"
+"loadLiveViewSize();checkStatus();statusInterval=setInterval(checkStatus,1000);"
 "</script></body></html>";
 
 // ============================================================================
@@ -679,6 +913,12 @@ static esp_err_t stream_handler(httpd_req_t *req) {
             ESP_LOGE(TAG, "Fallo camara");
             res = ESP_FAIL;
             break;
+        }
+
+        if (http_server_take_manual_capture_request()) {
+            g_capture_in_progress = true;
+            save_manual_capture_frame(fb->buf, fb->len);
+            g_capture_in_progress = false;
         }
 
         size_t hlen = snprintf(part_buf, sizeof(part_buf), 
@@ -988,14 +1228,22 @@ static esp_err_t favicon_handler(httpd_req_t *req) {
 
 // Estado del streaming
 static esp_err_t motion_status_handler(httpd_req_t *req) {
-    char response[128];
+    char response[384];
     bool active = http_server_is_streaming_active();
     int remaining = http_server_get_remaining_time();
     
     snprintf(response, sizeof(response), 
-        "{\"active\":%s,\"remaining\":%d,\"is_live\":%s,\"emission_time\":%d}",
+        "{\"active\":%s,\"remaining\":%d,\"is_live\":%s,\"emission_time\":%d,\"capture_mode\":%d,"
+        "\"manual_pending\":%s,\"capture_busy\":%s,\"capture_result_id\":%lu,"
+        "\"capture_last_ok\":%s,\"capture_last_file\":\"%s\",\"capture_last_msg\":\"%s\"}",
         active ? "true" : "false", remaining, 
-        g_force_stream ? "true" : "false", g_emission_time_sec);
+        g_force_stream ? "true" : "false", g_emission_time_sec, (int)g_capture_mode,
+        g_manual_capture_requested ? "true" : "false",
+        g_capture_in_progress ? "true" : "false",
+        (unsigned long)s_manual_capture_result_id,
+        s_manual_capture_last_ok ? "true" : "false",
+        s_manual_capture_last_file,
+        s_manual_capture_last_msg);
     
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
@@ -1084,9 +1332,101 @@ static esp_err_t motion_force_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t manual_capture_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+
+    if (!http_server_is_streaming_active()) {
+        set_manual_capture_result(false, "transmision inactiva", NULL);
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Activa Ver en vivo o espera movimiento\"}");
+        return ESP_OK;
+    }
+
+    if (!sd_card_is_mounted()) {
+        set_manual_capture_result(false, "microSD no montada", NULL);
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"La microSD no esta montada\"}");
+        return ESP_OK;
+    }
+
+    if (g_capture_in_progress || g_manual_capture_requested) {
+        set_manual_capture_result(false, "captura en curso", NULL);
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Ya hay una captura en curso\"}");
+        return ESP_OK;
+    }
+
+    char content[96] = {0};
+    if (req->content_len > 0) {
+        size_t to_read = req->content_len < (sizeof(content) - 1) ? req->content_len : (sizeof(content) - 1);
+        int ret = httpd_req_recv(req, content, to_read);
+        if (ret > 0) {
+            content[ret] = '\0';
+        }
+    }
+
+    char *epoch_str = strstr(content, "epoch=");
+    if (epoch_str) {
+        long long epoch = atoll(epoch_str + 6);
+        if (epoch > 1700000000LL) {
+            struct timeval tv = {
+                .tv_sec = (time_t)epoch,
+                .tv_usec = 0
+            };
+            settimeofday(&tv, NULL);
+        }
+    }
+
+    char *stamp_str = strstr(content, "stamp=");
+    if (stamp_str) {
+        char stamp[sizeof(s_manual_capture_stamp)] = {0};
+        stamp_str += 6;
+        size_t i = 0;
+        while (stamp_str[i] && stamp_str[i] != '&' && i < sizeof(stamp) - 1) {
+            stamp[i] = stamp_str[i];
+            i++;
+        }
+        stamp[i] = '\0';
+
+        if (is_valid_capture_stamp(stamp)) {
+            strncpy(s_manual_capture_stamp, stamp, sizeof(s_manual_capture_stamp) - 1);
+        }
+    }
+
+    if (g_force_stream) {
+        g_force_end_time = esp_timer_get_time() + ((int64_t)g_live_time_sec * 1000000);
+    }
+
+    ESP_LOGI(TAG, "Captura manual solicitada desde la web");
+    g_capture_in_progress = true;
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        g_capture_in_progress = false;
+        s_manual_capture_stamp[0] = '\0';
+        set_manual_capture_result(false, "no se pudo obtener frame de la camara", NULL);
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"No se pudo obtener imagen de la camara\"}");
+        return ESP_OK;
+    }
+
+    esp_err_t save_ret = save_manual_capture_frame(fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+    g_capture_in_progress = false;
+
+    if (save_ret != ESP_OK) {
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"No se pudo guardar en la microSD\"}");
+        return ESP_OK;
+    }
+
+    char response[128];
+    snprintf(response, sizeof(response), "{\"ok\":true,\"file\":\"%s\"}", s_manual_capture_last_file);
+    httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+
 // Detener stream forzado
 static esp_err_t motion_stop_handler(httpd_req_t *req) {
     g_force_stream = false;
+    g_manual_capture_requested = false;
+    g_capture_in_progress = false;
+    s_manual_capture_stamp[0] = '\0';
     ESP_LOGI(TAG, "Stream forzado detenido");
     
     httpd_resp_set_type(req, "application/json");
@@ -1391,6 +1731,7 @@ esp_err_t start_webserver(void) {
     httpd_uri_t uri_motion_config_post = { .uri = "/api/motion/config", .method = HTTP_POST, .handler = motion_config_handler };
     httpd_uri_t uri_motion_force = { .uri = "/api/motion/force", .method = HTTP_POST, .handler = motion_force_handler };
     httpd_uri_t uri_motion_stop = { .uri = "/api/motion/stop", .method = HTTP_POST, .handler = motion_stop_handler };
+    httpd_uri_t uri_manual_capture = { .uri = "/api/capture/manual", .method = HTTP_POST, .handler = manual_capture_handler };
     httpd_uri_t uri_device_config_get = { .uri = "/api/device/config", .method = HTTP_GET, .handler = device_config_handler };
     httpd_uri_t uri_device_config_post = { .uri = "/api/device/config", .method = HTTP_POST, .handler = device_config_handler };
 
@@ -1416,6 +1757,7 @@ esp_err_t start_webserver(void) {
     httpd_register_uri_handler(server_httpd, &uri_motion_config_post);
     httpd_register_uri_handler(server_httpd, &uri_motion_force);
     httpd_register_uri_handler(server_httpd, &uri_motion_stop);
+    httpd_register_uri_handler(server_httpd, &uri_manual_capture);
     httpd_register_uri_handler(server_httpd, &uri_device_config_get);
     httpd_register_uri_handler(server_httpd, &uri_device_config_post);
     httpd_register_uri_handler(server_httpd, &uri_wifi_status);
